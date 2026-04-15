@@ -3,13 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-from .deformation import knots_to_dense_flow, warp_image, create_grid
+from .deformation import knots_to_dense_flow, warp_image
 from .utils import to_torch, to_numpy
 from .metrics import LocalCrossCorrelation
 
 class PTVRegistration(nn.Module):
     def __init__(self, fixed_image, moving_image, grid_spacing=4, device='cpu', 
-                 lambda_reg=0.11, n_levels=3, metric='lcc', metric_param=2.1):
+                 lambda_reg=0.11, n_levels=3, metric='lcc', metric_param=2.1, k_down=0.7):
         """
         Args:
             fixed_image: (D, H, W) or (N, D, H, W) or None (for groupwise)
@@ -22,6 +22,11 @@ class PTVRegistration(nn.Module):
         """
         super().__init__()
         self.device = device
+        self.grid_spacing = grid_spacing
+        self.lambda_reg = lambda_reg
+        self.n_levels = n_levels
+        self.metric = metric
+        self.k_down = k_down
         
         # Handle inputs
         self.moving = to_torch(moving_image, device=device)
@@ -41,11 +46,6 @@ class PTVRegistration(nn.Module):
             self.fixed = None
             self.fixed_pyramid = None
 
-        self.grid_spacing = grid_spacing
-        self.lambda_reg = lambda_reg
-        self.n_levels = n_levels
-        self.metric = metric
-        
         if self.metric == 'lcc':
             self.metric_fn = LocalCrossCorrelation(sigma=metric_param, dim=3).to(device)
         
@@ -57,13 +57,30 @@ class PTVRegistration(nn.Module):
     def _create_pyramid(self, image, levels):
         pyramid = []
         current = image
+        
+        # Pre-create a simple Gaussian blur kernel for anti-aliasing during downsampling
+        # Sigma roughly matched to downscale factor 0.7 for standard anti-aliasing
+        sigma = 0.5 / self.k_down 
+        size = int(4 * sigma + 1) | 1 # ensure odd
+        coords = torch.arange(size, dtype=torch.float32, device=self.device) - (size - 1) / 2.0
+        g1d = torch.exp(-coords**2 / (2 * sigma**2))
+        g1d = g1d / g1d.sum()
+        
+        kz = g1d.view(1, 1, size, 1, 1)
+        ky = g1d.view(1, 1, 1, size, 1)
+        kx = g1d.view(1, 1, 1, 1, size)
+        
+        pad = size // 2
+        
         for i in range(levels):
             pyramid.append(current)
-            # Downsample for next level
-            # Use trilinear for 3D
             if i < levels - 1:
-                # Recompute scale factor to ensure proper downsampling
-                current = F.interpolate(current, scale_factor=0.5, mode='trilinear', align_corners=True, recompute_scale_factor=True)
+                # Anti-aliasing blur before downsampling
+                if current.dim() == 5:
+                    blurred = F.conv3d(current, kz, padding=(pad, 0, 0))
+                    blurred = F.conv3d(blurred, ky, padding=(0, pad, 0))
+                    blurred = F.conv3d(blurred, kx, padding=(0, 0, pad))
+                current = F.interpolate(blurred, scale_factor=self.k_down, mode='trilinear', align_corners=True, recompute_scale_factor=True)
         return pyramid[::-1] # Coarsest to finest
 
     def forward(self, level_idx):
@@ -81,26 +98,27 @@ class PTVRegistration(nn.Module):
         
         return warped, flow
 
-    def compute_loss(self, warped, fixed, flow):
-        # Regularization (Isotropic TV on flow)
-        # Calculate gradients of flow
-        dy = flow[:, :, :, 1:, :] - flow[:, :, :, :-1, :]
-        dx = flow[:, :, :, :, 1:] - flow[:, :, :, :, :-1]
-        dz = flow[:, :, 1:, :, :] - flow[:, :, :-1, :, :]
+    def get_Dk(self, knots):
+        # Calculate gradients of knots (forward differences)
+        dy = knots[:, :, :, 1:, :] - knots[:, :, :, :-1, :]
+        dx = knots[:, :, :, :, 1:] - knots[:, :, :, :, :-1]
+        dz = knots[:, :, 1:, :, :] - knots[:, :, :-1, :, :]
         
         # Pad to match sizes
         pad_x = F.pad(dx, (0, 1, 0, 0, 0, 0))
         pad_y = F.pad(dy, (0, 0, 0, 1, 0, 0))
         pad_z = F.pad(dz, (0, 0, 0, 0, 0, 1))
         
-        grad_mag = torch.sqrt(pad_x**2 + pad_y**2 + pad_z**2 + 1e-6)
-        tv_loss = torch.mean(grad_mag)
+        # Output is (N, 3, 3, D, H, W). dim=1 is displacement component, dim=2 is diff direction
+        Dk = torch.stack([pad_x, pad_y, pad_z], dim=2)
+        # Scale to dimensionless (pixel diff / pixel dist)
+        return Dk / max(1.0, float(self.grid_spacing))
 
+    def compute_loss(self, warped, fixed, flow, csqrt=5e-3):
         if self.metric == 'ssd':
             if fixed is None:
                 raise ValueError("Fixed image required for SSD metric")
-            ssd_loss = torch.mean((warped - fixed) ** 2)
-            metric_loss = ssd_loss
+            metric_loss = torch.mean((warped - fixed) ** 2)
         elif self.metric == 'lcc':
             if fixed is None:
                 raise ValueError("Fixed image required for LCC metric")
@@ -110,12 +128,19 @@ class PTVRegistration(nn.Module):
             N = warped.shape[0]
             flat_images = warped.view(N, -1).T # (Pixels, N)
             S = torch.linalg.svdvals(flat_images)
-            metric_loss = torch.sum(S)
-            metric_loss = metric_loss / flat_images.shape[0]
+            metric_loss = torch.sum(S) / flat_images.shape[0]
 
+        # Compute smoothed Isotropic TV gradient magnitudes matching COPD_final.m
+        # Uses `csqrt` to convert the L1 piecewise-rigid penalty softly into an elastic L2 penalty
+        # at small displacement gradients. This enables sliding at large tearing boundaries but keeps
+        # internal organs from stretching rigidly.
+        Dk_grad = self.get_Dk(self.knots)
+        grad_mag = torch.sqrt(torch.sum(Dk_grad**2, dim=(1, 2)) + csqrt)
+        tv_loss = torch.mean(grad_mag)
+        
         return metric_loss + self.lambda_reg * tv_loss, metric_loss, tv_loss
 
-    def optimize(self, iterations=80, lr=0.1):
+    def optimize(self, iterations=80, lr=1.0):
         """
         Run the multi-level optimization.
         iterations: int or list/tuple of ints. If list, specifies iterations for each level (coarsest to finest).
@@ -153,29 +178,37 @@ class PTVRegistration(nn.Module):
             else:
                 # Upsample knots from previous level
                 with torch.no_grad():
-                    # We simply double the resolution of the grid
-                    old_knot_shape = self.knots.shape[2:]
-                    new_knot_shape = [s * 2 for s in old_knot_shape]
+                    # We compute the exact knot shape for the current pyramid level
+                    qs = [max(3, s // self.grid_spacing) for s in current_shape]
                     
-                    upsampled_knots = F.interpolate(self.knots.data, size=new_knot_shape, mode='trilinear', align_corners=True)
-                    upsampled_knots = upsampled_knots * 2.0 # Scale displacements
+                    upsampled_knots = F.interpolate(self.knots.data, size=qs, mode='trilinear', align_corners=True)
+                    # Scale displacements by the inverse of the downscale factor to match the current pixel coordinate space
+                    upsampled_knots = upsampled_knots * (1.0 / self.k_down) 
                     self.knots = nn.Parameter(upsampled_knots)
             
-            # 2. Setup Optimizer
-            optimizer = optim.Adam([self.knots], lr=lr)
+            # 2. Setup Optimizer matching COPD_final.m
+            # Using standard LBFGS with max_iter = n_iters to let the quasi-Newton solver
+            # build up a strong Hessian approximation without ADMM interruptions.
+            optimizer = optim.LBFGS([self.knots], lr=lr, max_iter=n_iters, line_search_fn='strong_wolfe')
             
             # 3. Optimization Loop
-            for it in range(n_iters):
+            def closure():
                 optimizer.zero_grad()
                 warped, flow = self.forward(i)
-                
                 fixed_curr = self.fixed_pyramid[i] if self.fixed_pyramid else None
                 loss, m_loss, tv = self.compute_loss(warped, fixed_curr, flow)
-                
                 loss.backward()
-                optimizer.step()
-                
-                if it % 10 == 0:
-                    print(f"Iter {it}: Loss={loss.item():.6f}, Metric={m_loss.item():.6f}, TV={tv.item():.6f}")
+                return loss
+
+            # LBFGS runs internally for multiple iterations
+            for epoch in range(1):
+                optimizer.step(closure)
+            
+            # Manually run one more forward pass strictly for logging the level
+            with torch.no_grad():
+                warped, flow = self.forward(i)
+                fixed_curr = self.fixed_pyramid[i] if self.fixed_pyramid else None
+                _, m_loss, true_tv = self.compute_loss(warped, fixed_curr, flow)
+                print(f"Level {i}: Final Metric={m_loss.item():.6f}, True TV={true_tv.item():.6f}")
         
         return self.forward(self.n_levels - 1)
