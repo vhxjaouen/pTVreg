@@ -15,7 +15,6 @@ def main():
     parser.add_argument('-m', '--moving', required=True, help='Moving image path')
     parser.add_argument('-o', '--output', default='./moving_warped.nii.gz', help='Output warped image path (default: ./moving_warped.nii.gz)')
     
-    # -w arg: None if not present. If present but no value, use './warpfield.nii.gz'. If present with value, use value.
     parser.add_argument('-w', '--warp', nargs='?', const='./warpfield.nii.gz', default=None, 
                         help='Output warp field path. If flag is set without value, defaults to ./warpfield.nii.gz')
     
@@ -24,7 +23,6 @@ def main():
     parser.add_argument('--spacing', type=int, default=8, help='Grid spacing at finest level (default: 8)')
     parser.add_argument('--scale_factor', type=float, default=1.0, help='Downsample scale factor (e.g. 0.5 for 50%% size) to save memory. (default: 1.0)')
     
-    # COPD defaults
     parser.add_argument('--lambda_reg', type=float, default=0.15, help='Regularization weight (default: 0.15)')
     parser.add_argument('--iterations', type=int, nargs='+', default=[160, 120, 80], help='Iterations per level. Can be a single scalar or a list (coarsest to finest). (default: 160 120 80)')
     parser.add_argument('--metric', choices=['lcc', 'ssd', 'nuclear'], default='lcc', help='Similarity metric (default: lcc)')
@@ -44,14 +42,13 @@ def main():
     orig_shape = fixed_data.shape
     if args.scale_factor != 1.0:
         print(f"Scaling images by {args.scale_factor} for memory optimization...")
-        # ndimage.zoom for fast 3D resizing
+        # Scale for faster convergence and lower memory imprint on massive volumes
         fixed_data = ndimage.zoom(fixed_data, args.scale_factor, order=1)
         moving_data = ndimage.zoom(moving_data, args.scale_factor, order=1)
         print(f"Scaled shapes: {fixed_data.shape}")
 
-    # Normalize images strictly to [0, 1] as required by parameter scaling and the paper (Sec III. 1)
-
-    # This correctly scales LCC correlation and prevents floating point explosions in float32
+    # Normalize intensities strictly to [0, 1] 
+    # Ensures LCC correlation scales predictably within float32 limits
     fixed_data = (fixed_data - np.min(fixed_data)) / (np.ptp(fixed_data) + 1e-8)
     moving_data = (moving_data - np.min(moving_data)) / (np.ptp(moving_data) + 1e-8)
     
@@ -89,12 +86,12 @@ def main():
         full_flow = torch.nn.functional.interpolate(flow, size=orig_shape, mode=mode, align_corners=True).squeeze(0)
         full_flow = full_flow / args.scale_factor
         
-        # We need to warp the ORIGINAL moving image, so it matches original resolution
+        # Target original image space resolution to prevent quality loss in output
         print("Warping original resolution moving image with upsampled flow field...")
         moving_orig_tensor = torch.tensor(moving_img.get_fdata().astype(np.float32), device=device).unsqueeze(0).unsqueeze(0)
         full_flow_tensor = full_flow.unsqueeze(0).to(device)
         
-        # Try-except block for VRAM overflow since user has 24GB on 512x512x531 images
+        # If running large volumes, dynamically fallback to host RAM if GPU memory gets exceeded on the final high-res grid sample
         try:
             with torch.no_grad():
                 original_warped = warp_image(moving_orig_tensor, full_flow_tensor).squeeze().cpu().numpy()

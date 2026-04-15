@@ -7,9 +7,8 @@ _cached_grids = {}
 
 def create_normalized_grid(shape, device='cpu'):
     """
-    Create a standard normalized grid [-1, 1] of coordinates with (x,y,z) order 
-    for the given shape ready to plug directly into F.grid_sample.
-    Uses caching to drastically speed up multi-iteration solves.
+    Create a [-1, 1] normalized coordinate grid with (x,y,z) order,
+    compatible with F.grid_sample.
     """
     key = (tuple(shape), str(device))
     if key in _cached_grids:
@@ -52,10 +51,9 @@ def warp_image(image, flow, mode='bilinear', padding_mode='border'):
     scale_tensor = torch.tensor(scale, device=flow.device, dtype=flow.dtype).view(1, len(shape), *((1,) * len(shape)))
     norm_flow = flow * scale_tensor
     
-    # Repackage flow from (z, y, x) channels to the required (x, y, z) last-dimension format
+    # Repackage flow from (z, y, x) channels to the (x, y, z) last-dimension format
     norm_flow_permuted = norm_flow.flip(dims=[1]).permute(0, 2, 3, 4, 1)
     
-    # Compute sampling coords cleanly on GPU cache
     sample_coords = norm_grid + norm_flow_permuted
     
     return F.grid_sample(image, sample_coords, mode=mode, padding_mode=padding_mode, align_corners=True)

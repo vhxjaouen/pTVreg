@@ -131,9 +131,6 @@ class PTVRegistration(nn.Module):
             metric_loss = torch.sum(S) / flat_images.shape[0]
 
         # Compute smoothed Isotropic TV gradient magnitudes matching COPD_final.m
-        # Uses `csqrt` to convert the L1 piecewise-rigid penalty softly into an elastic L2 penalty
-        # at small displacement gradients. This enables sliding at large tearing boundaries but keeps
-        # internal organs from stretching rigidly.
         Dk_grad = self.get_Dk(self.knots)
         grad_mag = torch.sqrt(torch.sum(Dk_grad**2, dim=(1, 2)) + csqrt)
         tv_loss = torch.mean(grad_mag)
@@ -186,9 +183,7 @@ class PTVRegistration(nn.Module):
                     upsampled_knots = upsampled_knots * (1.0 / self.k_down) 
                     self.knots = nn.Parameter(upsampled_knots)
             
-            # 2. Setup Optimizer matching COPD_final.m
-            # Using standard LBFGS with max_iter = n_iters to let the quasi-Newton solver
-            # build up a strong Hessian approximation without ADMM interruptions.
+            # 2. Setup Optimizer
             optimizer = optim.LBFGS([self.knots], lr=lr, max_iter=n_iters, line_search_fn='strong_wolfe')
             
             # 3. Optimization Loop

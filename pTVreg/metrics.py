@@ -71,8 +71,7 @@ class LocalCrossCorrelation(nn.Module):
         I = fixed
         J = moving
         
-        # Cache static correlation values for the fixed image 
-        # (Massive 40% speed up assuming fixed image doesn't change throughout L-BFGS loop)
+        # Cache static correlation values for the fixed image.
         if not hasattr(self, '_cached_fixed') or self._cached_fixed is not I:
             self._cached_fixed = I
             self._mu_I = conv(I)
@@ -95,14 +94,11 @@ class LocalCrossCorrelation(nn.Module):
         var_J = F.relu(mu_J2 - mu_J**2)
         cov_IJ = mu_IJ - mu_I * mu_J
         
-        # Zero variance check (epsilon)
-        # Scaled down to 1e-8 since images are normalized to [0,1]
-        # Soft tissue variations might only have var ~ 1e-3, meaning var_I * var_J ~ 1e-6.
-        # An epsilon of 1e-5 would completely flatten the gradient topology.
+        # Zero variance regularization epsilon (1e-8 for normalized [0,1] images).
         epsilon = 1e-8
         
-        # LCC = cov^2 / (var_I * var_J)
+        # LCC calculation: cov^2 / (var_I * var_J)
         cc = cov_IJ**2 / (var_I * var_J + epsilon)
         
-        # Return negative mean CC (minimize)
+        # Return negative mean local cross-correlation.
         return -torch.mean(cc)
