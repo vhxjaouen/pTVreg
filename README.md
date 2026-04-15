@@ -17,18 +17,25 @@ This directory contains a pure Python/PyTorch implementation of the pTVreg image
 
 ## Installation
 
+You can install the package and its CLI tool globally or in your virtual environment:
+
 ```bash
-pip install -r requirements.txt
+# Install as an editable package (recommended for development)
+pip install -e .
 ```
+
+*Note: This automatically installs all required dependencies from `pyproject.toml` and makes the `ptvreg` command available everywhere.*
 
 ## Usage
 
 ### Command Line Interface (CLI)
 
+The new `ptvreg` CLI single-handedly handles scaling, solver optimization, and final high-res warp application. You no longer need separate scripts (like `pTVwarp.py`) to apply generated warp fields.
+
 Parameters have been mapped heavily for cross-modal MRI-to-CT rigid organ tracking.
 
 ```bash
-python pTVreg.py -f ct.nii.gz -m mri.nii.gz -w warp.nii.gz -o warped.nii.gz \
+ptvreg -f ct.nii.gz -m mri.nii.gz -w warp.nii.gz -o warped.nii.gz \
     --spacing 8 \
     --lambda_reg 0.15 \
     --iterations 160 120 80 \
@@ -62,7 +69,7 @@ warped, flow = reg.optimize(iterations=[160, 120, 80])
 
 ## Files
 
-*   `pTVreg.py`: CLI Entry point logic handling Niftis and argument routing.
-*   `registration.py`: Main `PTVRegistration` class handling the optimization loop, gradients and multi-resolution Gaussians.
-*   `deformation.py`: Core geometric primitives. Grid scaling, caching, displacement tensor math.
-*   `metrics.py`: The heavily structured LCC, SSD, and TV mathematical constraints.
+*   `pTVreg/cli.py`: The single CLI entry point that replaces previously separated scripts (`pTVreg.py`/`pTVwarp.py`). Handles PyTorch GPU dispatch, Niftis, and dynamic VRAM fallback scaling.
+*   `pTVreg/registration.py`: Main `PTVRegistration` class handling the optimization loop, gradients and multi-resolution Gaussians.
+*   `pTVreg/deformation.py`: Core geometric primitives. Grid scaling, caching, displacement tensor math.
+*   `pTVreg/metrics.py`: The heavily structured LCC, SSD, and TV mathematical constraints.

@@ -1,11 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "myproject"
+name = "pTVreg"
 version = "0.1.0"
+description = "PyTorch implementation of the pTVreg image registration algorithms."
+readme = "README.md"
+requires-python = ">=3.8"
 dependencies = [
-  "torch==2.10.0",
-  "torchvision==0.25.0",
-  "torchaudio==2.10.0"
+    "torch",
+    "numpy",
+    "scipy",
+    "nibabel"
 ]
 
-[tool.uv]
-torch-backend = "cu128"
+[project.scripts]
+ptvreg = "pTVreg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pTVreg", "pTVreg.*"]
