@@ -61,6 +61,9 @@ class PTVRegistration(nn.Module):
 
         if self.metric == 'lcc':
             self.metric_fn = LocalCrossCorrelation(sigma=metric_param, dim=3).to(device)
+        elif self.metric == 'ngf':
+            from pTVreg.metrics import NormalizedGradientField
+            self.metric_fn = NormalizedGradientField(alpha_NGF=metric_param).to(device)
         
         self.moving_pyramid = self._create_pyramid(self.moving, n_levels)
         
@@ -135,6 +138,10 @@ class PTVRegistration(nn.Module):
         elif self.metric == 'lcc':
             if fixed is None:
                 raise ValueError("Fixed image required for LCC metric")
+            metric_loss = self.metric_fn(fixed, warped)
+        elif self.metric == 'ngf':
+            if fixed is None:
+                raise ValueError("Fixed image required for NGF metric")
             metric_loss = self.metric_fn(fixed, warped)
         elif self.metric == 'nuclear':
             # Groupwise Nuclear Norm Metric

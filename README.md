@@ -49,6 +49,8 @@ ptvreg -f ct.nii.gz -m mri.nii.gz -w warp.nii.gz -o warped.nii.gz \
 *   `--lambda_reg 0.15`: The target regularization weight (coupled with the internal 5e-3 Huber norm smoothing). If a single value is provided (like 0.15), it is applied to the *finest* resolution scale. For each coarser scale above it, the weight is multiplied by 2 (e.g., for 3 levels, it becomes `[0.6, 0.3, 0.15]`). This enforces stiffer, smoother deformations at coarse levels to prevent large-scale folding, while allowing more precise sub-pixel alignments at fine levels. If you want explicit manual control over every scale, you can pass multiple values (e.g., `--lambda_reg 0.5 0.2 0.05`).
 *   `--iterations 160 120 80`: Drives the solver deeper on the coarsest scale, resolving gross mismatch before handling fine details.
 *   `--scale_factor 0.5`: Down-scales the entire volumetric stack (e.g. `512x512x531` -> `256x256x265`), solves the L-BFGS, then accurately reconstructs a `512` flow field.
+*   `--metric ngf`: Selects the metric to optimize. Available metrics include `lcc` (Local Cross-Correlation), `ssd` (Sum of Squared Differences), `nuclear`, AND `ngf` (Normalized Gradient Field for contrast-agnostic edge tracking).
+*   `--metric_param 0.05`: Used to adjust the respective selected metric dynamically (e.g. LCC requires a variance Gaussian $\sigma$ like `2.1`, while NGF requires an $\alpha$ noise-tolerance threshold like `0.05`.
 
 ### 2. `ptvwarp` (Apply Transformation)
 

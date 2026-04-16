@@ -12,7 +12,8 @@ dependencies = [
     "torch",
     "numpy",
     "scipy",
-    "nibabel"
+    "nibabel",
+    "kornia"
 ]
 
 [project.scripts]
