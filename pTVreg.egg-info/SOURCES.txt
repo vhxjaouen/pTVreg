@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 pTVreg/__init__.py
 pTVreg/cli.py
+pTVreg/cli_warp.py
 pTVreg/deformation.py
 pTVreg/metrics.py
 pTVreg/registration.py

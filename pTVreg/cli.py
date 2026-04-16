@@ -81,7 +81,8 @@ def main():
         print(f"Upsampling warp field back to original size {orig_shape}...")
         
         # Scale displacement magnitudes by inverse of scale factor
-        flow = flow.unsqueeze(0)
+        if flow.dim() == len(orig_shape) + 1:
+            flow = flow.unsqueeze(0)
         mode = 'trilinear' if len(orig_shape) == 3 else 'bilinear'
         full_flow = torch.nn.functional.interpolate(flow, size=orig_shape, mode=mode, align_corners=True).squeeze(0)
         full_flow = full_flow / args.scale_factor
