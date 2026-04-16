@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 ptvreg = "pTVreg.cli:main"
+ptvwarp = "pTVreg.cli_warp:main"
 
 [tool.setuptools.packages.find]
 include = ["pTVreg", "pTVreg.*"]
