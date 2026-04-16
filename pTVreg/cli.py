@@ -1,4 +1,5 @@
 import argparse
+import sys
 import os
 import torch
 import numpy as np
@@ -10,25 +11,29 @@ from pTVreg.deformation import warp_image
 
 
 def main():
-    parser = argparse.ArgumentParser(description='pTVreg: Python Image Registration')
+    parser = argparse.ArgumentParser(description='pTVreg: Python Image Registration', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-f', '--fixed', required=True, help='Fixed image path')
     parser.add_argument('-m', '--moving', required=True, help='Moving image path')
-    parser.add_argument('-o', '--output', default='./moving_warped.nii.gz', help='Output warped image path (default: ./moving_warped.nii.gz)')
+    parser.add_argument('-o', '--output', default='./moving_warped.nii.gz', help='Output warped image path')
     
     parser.add_argument('-w', '--warp', nargs='?', const='./warpfield.nii.gz', default=None, 
                         help='Output warp field path. If flag is set without value, defaults to ./warpfield.nii.gz')
     
-    parser.add_argument('--gpu', action='store_true', help='Force use GPU if available (default: auto-detect)')
-    parser.add_argument('--levels', type=int, default=3, help='Number of pyramid levels')
-    parser.add_argument('--spacing', type=int, default=8, help='Grid spacing at finest level (default: 8)')
-    parser.add_argument('--scale_factor', type=float, default=1.0, help='Downsample scale factor (e.g. 0.5 for 50%% size) to save memory. (default: 1.0)')
+    parser.add_argument('--gpu', action='store_true', help='Force use GPU if available')
+    parser.add_argument('--levels', type=int, default=3, help='Number of pyramid levels (indicative range: 3-5)')
+    parser.add_argument('--spacing', type=int, default=8, help='Grid spacing at finest level, in voxels (indicative: 4, 8, 16)')
+    parser.add_argument('--scale_factor', type=float, default=1.0, help='Downsample scale factor (e.g. 0.5 for 50%% size) to save memory and speed up processing.')
     
-    parser.add_argument('--lambda_reg', type=float, default=0.15, help='Regularization weight (default: 0.15)')
-    parser.add_argument('--iterations', type=int, nargs='+', default=[160, 120, 80], help='Iterations per level. Can be a single scalar or a list (coarsest to finest). (default: 160 120 80)')
+    parser.add_argument('--lambda_reg', type=float, nargs='+', default=[0.15], help='Regularization weight base, or list per scale (indicative range: 0.05 - 0.5)')
+    parser.add_argument('--iterations', type=int, nargs='+', default=[160, 120, 80], help='Iterations per level. Can be a single scalar or a list (coarsest to finest). (indicative: 50-300 per level)')
     parser.add_argument('--metric', choices=['lcc', 'ssd', 'nuclear'], default='lcc', help='Similarity metric (default: lcc)')
-    parser.add_argument('--metric_param', type=float, default=2.1, help='Metric parameter (e.g. LCC sigma, default: 2.1)')
+    parser.add_argument('--metric_param', type=float, default=2.1, help='Metric parameter (e.g. LCC sigma). (indicative range: 1.5 - 4.0)')
 
     
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+        
     args = parser.parse_args()
     
     print(f"Loading fixed: {args.fixed}")
@@ -50,7 +55,9 @@ def main():
     # Normalize intensities strictly to [0, 1] 
     # Ensures LCC correlation scales predictably within float32 limits
     fixed_data = (fixed_data - np.min(fixed_data)) / (np.ptp(fixed_data) + 1e-8)
-    moving_data = (moving_data - np.min(moving_data)) / (np.ptp(moving_data) + 1e-8)
+    moving_min = np.min(moving_data)
+    moving_ptp = np.ptp(moving_data) + 1e-8
+    moving_data = (moving_data - moving_min) / moving_ptp
     
     # Auto-detect GPU
     if torch.cuda.is_available():
@@ -107,9 +114,11 @@ def main():
         flow_np = full_flow.detach().cpu().numpy()
     else:
         warped_np = warped.detach().cpu().numpy().squeeze()
+        warped_np = (warped_np * moving_ptp) + moving_min
         flow_np = flow.detach().cpu().numpy().squeeze() # (3, D, H, W)
         
     # Use affine from fixed image since we registered to it
+    warped_np = warped_np.astype(moving_img.get_data_dtype())
     save_nifti(warped_np, args.output, affine=fixed_img.affine)
     
     # Save warp field if requested
@@ -117,7 +126,8 @@ def main():
         print(f"Saving warp field to: {args.warp}")
         
         # Save as (D, H, W, 3) for compatibility with standard viewers
-        flow_save = np.moveaxis(flow_np, 0, -1) 
+        # Compress as float16 to save significant disk space (deformations are usually smooth, precision loss is negligible)
+        flow_save = np.moveaxis(flow_np, 0, -1).astype(np.float16) 
 
         
         # Save vector field

@@ -23,8 +23,21 @@ class PTVRegistration(nn.Module):
         super().__init__()
         self.device = device
         self.grid_spacing = grid_spacing
-        self.lambda_reg = lambda_reg
         self.n_levels = n_levels
+        
+        # Process lambda_reg array / scalar
+        if isinstance(lambda_reg, (list, tuple)):
+            if len(lambda_reg) == 1:
+                base = lambda_reg[0]
+                self.lambda_reg = [base * (2 ** (self.n_levels - 1 - i)) for i in range(self.n_levels)]
+            elif len(lambda_reg) != self.n_levels:
+                raise ValueError(f"lambda_reg list must have {self.n_levels} elements.")
+            else:
+                self.lambda_reg = list(lambda_reg)
+        else:
+            base = float(lambda_reg)
+            # Default scaling: stiffer at coarse levels, looser at fine levels
+            self.lambda_reg = [base * (2 ** (self.n_levels - 1 - i)) for i in range(self.n_levels)]
         self.metric = metric
         self.k_down = k_down
         
@@ -114,7 +127,7 @@ class PTVRegistration(nn.Module):
         # Scale to dimensionless (pixel diff / pixel dist)
         return Dk / max(1.0, float(self.grid_spacing))
 
-    def compute_loss(self, warped, fixed, flow, csqrt=5e-3):
+    def compute_loss(self, warped, fixed, flow, level_idx, csqrt=5e-3):
         if self.metric == 'ssd':
             if fixed is None:
                 raise ValueError("Fixed image required for SSD metric")
@@ -135,7 +148,8 @@ class PTVRegistration(nn.Module):
         grad_mag = torch.sqrt(torch.sum(Dk_grad**2, dim=(1, 2)) + csqrt)
         tv_loss = torch.mean(grad_mag)
         
-        return metric_loss + self.lambda_reg * tv_loss, metric_loss, tv_loss
+        current_lambda = self.lambda_reg[level_idx]
+        return metric_loss + current_lambda * tv_loss, metric_loss, tv_loss
 
     def optimize(self, iterations=80, lr=1.0):
         """
@@ -191,7 +205,7 @@ class PTVRegistration(nn.Module):
                 optimizer.zero_grad()
                 warped, flow = self.forward(i)
                 fixed_curr = self.fixed_pyramid[i] if self.fixed_pyramid else None
-                loss, m_loss, tv = self.compute_loss(warped, fixed_curr, flow)
+                loss, m_loss, tv = self.compute_loss(warped, fixed_curr, flow, i)
                 loss.backward()
                 return loss
 
@@ -203,7 +217,7 @@ class PTVRegistration(nn.Module):
             with torch.no_grad():
                 warped, flow = self.forward(i)
                 fixed_curr = self.fixed_pyramid[i] if self.fixed_pyramid else None
-                _, m_loss, true_tv = self.compute_loss(warped, fixed_curr, flow)
+                _, m_loss, true_tv = self.compute_loss(warped, fixed_curr, flow, i)
                 print(f"Level {i}: Final Metric={m_loss.item():.6f}, True TV={true_tv.item():.6f}")
         
         return self.forward(self.n_levels - 1)

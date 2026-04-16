@@ -1,4 +1,5 @@
 import argparse
+import sys
 import numpy as np
 import nibabel as nib
 from scipy.ndimage import map_coordinates
@@ -8,7 +9,7 @@ def save_nifti(data, path, affine=np.eye(4)):
     nib.save(img, path)
 
 def main():
-    parser = argparse.ArgumentParser(description='pTVwarp: Apply warp field to moving image, resampling to reference space.')
+    parser = argparse.ArgumentParser(description='pTVwarp: Apply warp field to moving image, resampling to reference space.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-i', '--input', required=True, help='Input moving image')
     parser.add_argument('-r', '--ref', required=True, help='Reference fixed image (defines output space and header)')
     parser.add_argument('-w', '--warp', required=True, help='Warp field (NIfTI, pTVreg format)')
@@ -16,6 +17,10 @@ def main():
     parser.add_argument('--interp', choices=['linear', 'cubic', 'nearest'], default='cubic', 
                         help='Interpolation order (default: cubic)')
     
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+        
     args = parser.parse_args()
     
     print(f"Loading reference: {args.ref}")
