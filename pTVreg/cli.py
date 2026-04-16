@@ -24,7 +24,7 @@ def main():
     parser.add_argument('--spacing', type=int, default=8, help='Grid spacing at finest level, in voxels (indicative: 4, 8, 16)')
     parser.add_argument('--scale_factor', type=float, default=1.0, help='Downsample scale factor (e.g. 0.5 for 50%% size) to save memory and speed up processing.')
     
-    parser.add_argument('--lambda_reg', type=float, nargs='+', default=[0.15], help='Regularization weight base, or list per scale (indicative range: 0.05 - 0.5)')
+    parser.add_argument('--lambda_reg', type=float, nargs='+', default=[0.15], help='Regularization weight base, or list per scale. If a single value is provided, it is used for the finest scale, and multiplied by 2 for each coarser scale (indicative range: 0.05 - 0.5)')
     parser.add_argument('--iterations', type=int, nargs='+', default=[160, 120, 80], help='Iterations per level. Can be a single scalar or a list (coarsest to finest). (indicative: 50-300 per level)')
     parser.add_argument('--metric', choices=['lcc', 'ssd', 'nuclear'], default='lcc', help='Similarity metric (default: lcc)')
     parser.add_argument('--metric_param', type=float, default=2.1, help='Metric parameter (e.g. LCC sigma). (indicative range: 1.5 - 4.0)')

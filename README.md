@@ -30,9 +30,11 @@ pip install -e .
 
 ### Command Line Interface (CLI)
 
-The new `ptvreg` CLI single-handedly handles scaling, solver optimization, and final high-res warp application. You no longer need separate scripts (like `pTVwarp.py`) to apply generated warp fields.
+The package provides two CLI tools:
 
-Parameters have been mapped heavily for cross-modal MRI-to-CT rigid organ tracking.
+### 1. `ptvreg` (Image Registration)
+
+The `ptvreg` CLI single-handedly handles scaling, solver optimization, and final high-res warp application.
 
 ```bash
 ptvreg -f ct.nii.gz -m mri.nii.gz -w warp.nii.gz -o warped.nii.gz \
@@ -44,9 +46,17 @@ ptvreg -f ct.nii.gz -m mri.nii.gz -w warp.nii.gz -o warped.nii.gz \
 
 **Parameters Check:**
 *   `--spacing 8`: Allows smooth, non-tearing biological boundaries in 3D patches.
-*   `--lambda_reg 0.15`: The target regularization weight (coupled with the internal 5e-3 Huber norm smoothing).
+*   `--lambda_reg 0.15`: The target regularization weight (coupled with the internal 5e-3 Huber norm smoothing). If a single value is provided (like 0.15), it is applied to the *finest* resolution scale. For each coarser scale above it, the weight is multiplied by 2 (e.g., for 3 levels, it becomes `[0.6, 0.3, 0.15]`). This enforces stiffer, smoother deformations at coarse levels to prevent large-scale folding, while allowing more precise sub-pixel alignments at fine levels. If you want explicit manual control over every scale, you can pass multiple values (e.g., `--lambda_reg 0.5 0.2 0.05`).
 *   `--iterations 160 120 80`: Drives the solver deeper on the coarsest scale, resolving gross mismatch before handling fine details.
 *   `--scale_factor 0.5`: Down-scales the entire volumetric stack (e.g. `512x512x531` -> `256x256x265`), solves the L-BFGS, then accurately reconstructs a `512` flow field.
+
+### 2. `ptvwarp` (Apply Transformation)
+
+Use `ptvwarp` to apply a previously computed transformation field onto a new image (e.g., reslicing moving segmented masks into the fixed image physical space natively via exact NIfTI affines without registration):
+
+```bash
+ptvwarp -i moving_mask.nii.gz -r fixed_ct.nii.gz -w warp.nii.gz -o resliced_mask.nii.gz --interp nearest
+```
 
 ### Pairwise Registration (Fixed vs Moving in Code)
 
