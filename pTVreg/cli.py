@@ -104,7 +104,7 @@ def main():
                 original_warped = warp_image(moving_orig_tensor, full_flow_tensor).squeeze().numpy()
             
         warped_np = original_warped
-        flow_np = full_flow.cpu().numpy()
+        flow_np = full_flow.detach().cpu().numpy()
     else:
         warped_np = warped.detach().cpu().numpy().squeeze()
         flow_np = flow.detach().cpu().numpy().squeeze() # (3, D, H, W)
