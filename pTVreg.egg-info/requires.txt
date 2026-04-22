@@ -2,3 +2,5 @@ torch
 numpy
 scipy
 nibabel
+kornia
+optuna

@@ -43,5 +43,7 @@ def load_data(path):
 def save_nifti(data, path, affine=np.eye(4)):
     """Save data as NIfTI file."""
     data = to_numpy(data)
+    if data.dtype == np.float16:
+        data = data.astype(np.float32)
     img = nib.Nifti1Image(data, affine)
     nib.save(img, path)

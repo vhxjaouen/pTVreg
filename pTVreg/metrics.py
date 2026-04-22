@@ -44,7 +44,7 @@ class LocalCrossCorrelation(nn.Module):
             
         return None
 
-    def forward(self, fixed, moving):
+    def forward(self, fixed, moving, return_map=False):
         # fixed, moving: (N, 1, D, H, W)
         
         # Ensure correct device
@@ -101,38 +101,156 @@ class LocalCrossCorrelation(nn.Module):
         cc = cov_IJ**2 / (var_I * var_J + epsilon)
         
         # Return negative mean local cross-correlation.
-        return -torch.mean(cc)
+        return -cc if return_map else -torch.mean(cc)
 
 from kornia.filters import SpatialGradient3d
+
+class EdgeMSE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, img1, img2, return_map=False):
+        grad_src = SpatialGradient3d()(img1)
+        grad_tgt = SpatialGradient3d()(img2)
+
+        src_x = grad_src[:,:,0,:,:,:]
+        src_y = grad_src[:,:,1,:,:,:]
+        src_z = grad_src[:,:,2,:,:,:]
+        tgt_x = grad_tgt[:,:,0,:,:,:]
+        tgt_y = grad_tgt[:,:,1,:,:,:]
+        tgt_z = grad_tgt[:,:,2,:,:,:]
+
+        gradmag_src = torch.sqrt(torch.pow(src_x, 2) + torch.pow(src_y, 2) + torch.pow(src_z, 2) + 1e-8)
+        gradmag_tgt = torch.sqrt(torch.pow(tgt_x, 2) + torch.pow(tgt_y, 2) + torch.pow(tgt_z, 2) + 1e-8)
+        
+        # Mean Squared Error on the edge magnitudes
+        emse = (gradmag_src - gradmag_tgt)**2
+        # Normalize the MSE by the variance/mean of the fixed image's edge magnitude
+        # This keeps the gradients significantly active and bounded on the order of 1.0
+        # otherwise the sub-0.001 gradients are completely masked by the lambda_reg penalty
+        emse_norm = emse / (torch.mean(gradmag_src**2) + 1e-8)
+        if return_map: return emse_norm
+        return torch.mean(emse_norm)
 
 class NormalizedGradientField(nn.Module):
     def __init__(self, alpha_NGF=0.05):
         super().__init__()
         self.alpha_NGF = alpha_NGF
-        self.spatial_grad = SpatialGradient3d()
         
-    def forward(self, fixed, moving):
-        # fixed, moving: (N, 1, D, H, W)
-        
-        grad_src = self.spatial_grad(fixed)
-        grad_tgt = self.spatial_grad(moving)
-        
-        # kornia SpatialGradient3d returns (B, C, 3, D, H, W)
-        src_x = grad_src[:, :, 0, ...]
-        src_y = grad_src[:, :, 1, ...]
-        src_z = grad_src[:, :, 2, ...]
-        
-        tgt_x = grad_tgt[:, :, 0, ...]
-        tgt_y = grad_tgt[:, :, 1, ...]
-        tgt_z = grad_tgt[:, :, 2, ...]
-        
-        gradmag_src = torch.sqrt(src_x**2 + src_y**2 + src_z**2 + self.alpha_NGF**2)
-        gradmag_tgt = torch.sqrt(tgt_x**2 + tgt_y**2 + tgt_z**2 + self.alpha_NGF**2)
+    def forward(self, img1, img2, return_map=False):
+        grad_src = SpatialGradient3d()(img1)
+        grad_tgt = SpatialGradient3d()(img2)
+
+        src_x = grad_src[:,:,0,:,:,:]
+        src_y = grad_src[:,:,1,:,:,:]
+        src_z = grad_src[:,:,2,:,:,:]
+        tgt_x = grad_tgt[:,:,0,:,:,:]
+        tgt_y = grad_tgt[:,:,1,:,:,:]
+        tgt_z = grad_tgt[:,:,2,:,:,:]
+
+        mag_src = torch.sqrt(src_x**2 + src_y**2 + src_z**2 + 1e-8)
+        mag_tgt = torch.sqrt(tgt_x**2 + tgt_y**2 + tgt_z**2 + 1e-8)
+
+        # Adaptive alpha: correct the vanishing gradient by scaling the noise threshold 
+        # relative to the actual mean gradient magnitude of the images.
+        # This properly weights the vectors regardless of [0, 1] normalizations.
+        alpha_src_sq = (self.alpha_NGF * torch.mean(mag_src))**2 + 1e-8
+        alpha_tgt_sq = (self.alpha_NGF * torch.mean(mag_tgt))**2 + 1e-8
+
+        gradmag_src = torch.sqrt(mag_src**2 + alpha_src_sq)
+        gradmag_tgt = torch.sqrt(mag_tgt**2 + alpha_tgt_sq)
         
         eps = 1e-8
-        NGF = 1.0 - 0.5 * (((src_x / (gradmag_src + eps)) * (tgt_x / (gradmag_tgt + eps)) + 
-                            (src_y / (gradmag_src + eps)) * (tgt_y / (gradmag_tgt + eps)) + 
-                            (src_z / (gradmag_src + eps)) * (tgt_z / (gradmag_tgt + eps))) ** 2)
+        dot_sq = torch.pow((src_x/(gradmag_src + eps) * tgt_x/(gradmag_tgt + eps) + 
+                            src_y/(gradmag_src + eps) * tgt_y/(gradmag_tgt + eps) + 
+                            src_z/(gradmag_src + eps) * tgt_z/(gradmag_tgt + eps)), 2)
         
-        return torch.mean(NGF)
+        NGF = 1.0 - 0.5 * dot_sq
+
+        # To ensure the solver gradients compete robustly with the TV regularization multiplier (~0.15),
+        # we can scale the loss strictly to a zero-centered landscape, or just return the standard mean.
+        # The adaptive alpha natively restores the gradient magnitudes!
+        if return_map:
+            return NGF * 100.0
+        else:
+            return torch.mean(NGF) * 100.0
+
+class VectorFieldConvolution(nn.Module):
+    def __init__(self, gamma=1.7, kernel_size=11):
+        super().__init__()
+        self.gamma = gamma
+        self.kernel_size = kernel_size
         
+        # Create Vector Field kernel
+        self._create_vfc_kernel()
+        
+    def _create_vfc_kernel(self):
+        # Create grid centered at 0
+        r = self.kernel_size // 2
+        z, y, x = torch.meshgrid(
+            torch.arange(-r, r + 1, dtype=torch.float32),
+            torch.arange(-r, r + 1, dtype=torch.float32),
+            torch.arange(-r, r + 1, dtype=torch.float32),
+            indexing='ij'
+        )
+        
+        # Calculate distance R
+        dist = torch.sqrt(x**2 + y**2 + z**2 + 1e-8)
+        
+        # Vector field components pointing towards the edges
+        vx = -x / (dist ** (self.gamma + 1) + 1e-8)
+        vy = -y / (dist ** (self.gamma + 1) + 1e-8)
+        vz = -z / (dist ** (self.gamma + 1) + 1e-8)
+        
+        # Origin has 0 influence
+        vx[dist < 1e-8] = 0
+        vy[dist < 1e-8] = 0
+        vz[dist < 1e-8] = 0
+        
+        # Reshape to (Out_channels, In_channels, D, H, W) -> (3, 1, D, H, W)
+        kernel = torch.stack([vx, vy, vz], dim=0).unsqueeze(1)
+        self.register_buffer('vfc_kernel', kernel)
+        
+    def forward(self, img1, img2, return_map=False):
+        grad_src = SpatialGradient3d()(img1)
+        grad_tgt = SpatialGradient3d()(img2)
+
+        src_x = grad_src[:,:,0,:,:,:]
+        src_y = grad_src[:,:,1,:,:,:]
+        src_z = grad_src[:,:,2,:,:,:]
+        tgt_x = grad_tgt[:,:,0,:,:,:]
+        tgt_y = grad_tgt[:,:,1,:,:,:]
+        tgt_z = grad_tgt[:,:,2,:,:,:]
+
+        # Edge magnitude maps
+        mag_src = torch.sqrt(src_x**2 + src_y**2 + src_z**2 + 1e-8)
+        mag_tgt = torch.sqrt(tgt_x**2 + tgt_y**2 + tgt_z**2 + 1e-8)
+
+        # 1. Scale edge maps strictly to [0,1] range per sample
+        b = mag_src.shape[0]
+        max_src = mag_src.view(b, -1).max(dim=1)[0].view(b, 1, 1, 1, 1) + 1e-8
+        max_tgt = mag_tgt.view(b, -1).max(dim=1)[0].view(b, 1, 1, 1, 1) + 1e-8
+        
+        mag_src = mag_src / max_src
+        mag_tgt = mag_tgt / max_tgt
+
+        # Compute Dense Vector Convolution Fields 
+        # Output shape: (N, 3, D, H, W)
+        padding = self.kernel_size // 2
+        vfc_src = F.conv3d(mag_src, self.vfc_kernel, padding=padding)
+        vfc_tgt = F.conv3d(mag_tgt, self.vfc_kernel, padding=padding)
+        
+        # 2. Maximize the dot product (Cosine Similarity) of the vector fields!
+        # Rather than flattening MSE, we measure structural alignment directly.
+        # The adaptive alpha threshold suppresses chaotic gradients in empty background zones.
+        alpha_sq = torch.mean(vfc_src**2) + 1e-8
+        
+        dot = torch.sum(vfc_src * vfc_tgt, dim=1, keepdim=True)
+        mag_sq_src = torch.sum(vfc_src**2, dim=1, keepdim=True) + alpha_sq
+        mag_sq_tgt = torch.sum(vfc_tgt**2, dim=1, keepdim=True) + alpha_sq
+        
+        # vfc_ncc in [-1, 1]
+        vfc_ncc = dot / torch.sqrt(mag_sq_src * mag_sq_tgt)
+        
+        # We negate it to maximize the dot product alignment, scaling to compete with lambda_reg (0.15)
+        return -vfc_ncc * 100.0 if return_map else -torch.mean(vfc_ncc) * 100.0

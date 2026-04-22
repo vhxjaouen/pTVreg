@@ -3,3 +3,5 @@ scipy
 torch
 nibabel
 matplotlib
+kornia
+optuna

@@ -5,10 +5,11 @@ import torch.optim as optim
 import numpy as np
 from .deformation import knots_to_dense_flow, warp_image
 from .utils import to_torch, to_numpy
-from .metrics import LocalCrossCorrelation
+from .metrics import LocalCrossCorrelation, EdgeMSE, NormalizedGradientField, VectorFieldConvolution
 
 class PTVRegistration(nn.Module):
-    def __init__(self, fixed_image, moving_image, grid_spacing=4, device='cpu', 
+    def __init__(self, fixed_image, moving_image, fixed_mask=None, border_mask=5,
+                 grid_spacing=4, device='cpu', 
                  lambda_reg=0.11, n_levels=3, metric='lcc', metric_param=2.1, k_down=0.7):
         """
         Args:
@@ -28,18 +29,37 @@ class PTVRegistration(nn.Module):
         # Process lambda_reg array / scalar
         if isinstance(lambda_reg, (list, tuple)):
             if len(lambda_reg) == 1:
-                base = lambda_reg[0]
-                self.lambda_reg = [base * (2 ** (self.n_levels - 1 - i)) for i in range(self.n_levels)]
+                self.lambda_reg = [float(lambda_reg[0])] * self.n_levels
             elif len(lambda_reg) != self.n_levels:
                 raise ValueError(f"lambda_reg list must have {self.n_levels} elements.")
             else:
                 self.lambda_reg = list(lambda_reg)
         else:
-            base = float(lambda_reg)
-            # Default scaling: stiffer at coarse levels, looser at fine levels
-            self.lambda_reg = [base * (2 ** (self.n_levels - 1 - i)) for i in range(self.n_levels)]
+            self.lambda_reg = [float(lambda_reg)] * self.n_levels
         self.metric = metric
         self.k_down = k_down
+        self.border_mask = border_mask
+        if fixed_mask is not None:
+            mask_t = to_torch(fixed_mask, device=device, dtype=torch.float32)
+            if mask_t.ndim == 3:
+                mask_t = mask_t.unsqueeze(0).unsqueeze(0)
+            elif mask_t.ndim == 4:
+                mask_t = mask_t.unsqueeze(0)
+            self.fixed_mask = mask_t
+        else:
+            self.fixed_mask = None
+        self.border_mask = border_mask
+        
+        if fixed_mask is not None:
+            # Match padding/shape logic of fixed_image
+            mask_t = to_torch(fixed_mask, device=device, dtype=torch.float32)
+            if mask_t.ndim == 3:
+                mask_t = mask_t.unsqueeze(0).unsqueeze(0)
+            elif mask_t.ndim == 4:
+                mask_t = mask_t.unsqueeze(0)
+            self.fixed_mask = mask_t
+        else:
+            self.fixed_mask = None
         
         # Handle inputs
         self.moving = to_torch(moving_image, device=device)
@@ -61,9 +81,12 @@ class PTVRegistration(nn.Module):
 
         if self.metric == 'lcc':
             self.metric_fn = LocalCrossCorrelation(sigma=metric_param, dim=3).to(device)
+        elif self.metric == 'emse':
+            self.metric_fn = EdgeMSE().to(device)
         elif self.metric == 'ngf':
-            from pTVreg.metrics import NormalizedGradientField
             self.metric_fn = NormalizedGradientField(alpha_NGF=metric_param).to(device)
+        elif self.metric == 'vfc':
+            self.metric_fn = VectorFieldConvolution(gamma=metric_param).to(device)
         
         self.moving_pyramid = self._create_pyramid(self.moving, n_levels)
         
@@ -131,18 +154,39 @@ class PTVRegistration(nn.Module):
         return Dk / max(1.0, float(self.grid_spacing))
 
     def compute_loss(self, warped, fixed, flow, level_idx, csqrt=5e-3):
-        if self.metric == 'ssd':
-            if fixed is None:
-                raise ValueError("Fixed image required for SSD metric")
-            metric_loss = torch.mean((warped - fixed) ** 2)
-        elif self.metric == 'lcc':
-            if fixed is None:
-                raise ValueError("Fixed image required for LCC metric")
-            metric_loss = self.metric_fn(fixed, warped)
-        elif self.metric == 'ngf':
-            if fixed is None:
-                raise ValueError("Fixed image required for NGF metric")
-            metric_loss = self.metric_fn(fixed, warped)
+        if fixed is not None:
+            if self.metric == 'ssd':
+                metric_map = (warped - fixed) ** 2
+            else:
+                metric_map = self.metric_fn(fixed, warped, return_map=True)
+                
+            # Create boolean active mask mapped to current scale
+            active_mask = torch.ones_like(warped, dtype=torch.bool)
+            
+            # Apply fixed anatomical mask if provided
+            if self.fixed_mask is not None:
+                # Resize fixed_mask to current resolution 
+                curr_shape = warped.shape[2:]
+                mask_curr = F.interpolate(self.fixed_mask, size=curr_shape, mode='nearest') > 0.5
+                active_mask = active_mask & mask_curr
+                
+            # Apply border masking (skip metric around padding/zero-borders)
+            # We scale the boundary size by the level resolution
+            # To match MATLAB's behavior, we simply trim visually padded boundaries
+            bm = self.border_mask
+            if bm > 0:
+                active_mask[:, :, :bm, :, :] = False
+                active_mask[:, :, -bm:, :, :] = False
+                active_mask[:, :, :, :bm, :] = False
+                active_mask[:, :, :, -bm:, :] = False
+                active_mask[:, :, :, :, :bm] = False
+                active_mask[:, :, :, :, -bm:] = False
+                
+            # Compute final aggregate metric only over the active mapped region!
+            if active_mask.any():
+                metric_loss = metric_map[active_mask].mean()
+            else:
+                metric_loss = metric_map.mean()
         elif self.metric == 'nuclear':
             # Groupwise Nuclear Norm Metric
             N = warped.shape[0]
