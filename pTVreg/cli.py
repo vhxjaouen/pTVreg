@@ -43,10 +43,18 @@ def main():
     
     if args.config:
         print(f"Loading configuration from {args.config}")
+        # Parse which arguments were explicitly passed on the command line to prevent overwriting them
+        specified_args = set()
+        for arg in sys.argv[1:]:
+            for action in parser._actions:
+                for opt in action.option_strings:
+                    if arg == opt or arg.startswith(opt + '='):
+                        specified_args.add(action.dest)
+                        
         with open(args.config, 'r') as f:
             config_data = json.load(f)
             for key, value in config_data.items():
-                if hasattr(args, key) and key != 'config':
+                if hasattr(args, key) and key != 'config' and key not in specified_args:
                     setattr(args, key, value)
                     
     if not args.fixed or not args.moving:
