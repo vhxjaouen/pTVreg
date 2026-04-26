@@ -30,35 +30,54 @@ pip install -e .
 
 ### Command Line Interface (CLI)
 
-The package provides two CLI tools:
+The package provides two main CLI tools for registration and applying warps:
 
 ### 1. `ptvreg` (Image Registration)
 
-The `ptvreg` CLI single-handedly handles scaling, solver optimization, and final high-res warp application.
+The `ptvreg` CLI single-handedly handles scaling, solver optimization, and final high-res warp application. It supports loading parameters from a JSON configuration file.
 
 ```bash
 ptvreg -f ct.nii.gz -m mri.nii.gz -w warp.nii.gz -o warped.nii.gz \
-    --spacing 8 \
-    --lambda_reg 0.15 \
-    --iterations 160 120 80 \
-    --scale_factor 0.5 
+    --spacing 8 --lambda_reg 0.15 --iterations 160 120 80 --scale_factor 0.5 
 ```
 
-**Parameters Check:**
-*   `--spacing 8`: Allows smooth, non-tearing biological boundaries in 3D patches.
-*   `--lambda_reg 0.15`: The target regularization weight (coupled with the internal 5e-3 Huber norm smoothing). If a single value is provided (like 0.15), it is applied to the *finest* resolution scale. For each coarser scale above it, the weight is multiplied by 2 (e.g., for 3 levels, it becomes `[0.6, 0.3, 0.15]`). This enforces stiffer, smoother deformations at coarse levels to prevent large-scale folding, while allowing more precise sub-pixel alignments at fine levels. If you want explicit manual control over every scale, you can pass multiple values (e.g., `--lambda_reg 0.5 0.2 0.05`).
-*   `--iterations 160 120 80`: Drives the solver deeper on the coarsest scale, resolving gross mismatch before handling fine details.
-*   `--scale_factor 0.5`: Down-scales the entire volumetric stack (e.g. `512x512x531` -> `256x256x265`), solves the L-BFGS, then accurately reconstructs a `512` flow field.
-*   `--metric emse`: Selects the metric to optimize. Available metrics include `lcc` (Local Cross-Correlation), `ssd` (Sum of Squared Differences), `nuclear`, AND `emse` (Edge Mean Squared Error), and `ngf` (Normalized Gradient Field).
-*   `--metric_param 0.05`: Used to adjust the respective selected metric dynamically (e.g. LCC requires a variance Gaussian $\sigma$ like `2.1`.
+**Alternatively, use a JSON config file to bypass command line arguments:**
+```bash
+ptvreg -c config.json
+```
+
+**Full Argument List:**
+*   `-c, --config`: Path to JSON configuration file to automatically populate all parameters (bypasses command line arguments).
+*   `-f, --fixed`: Fixed (target) image path. Required unless `--config` is provided.
+*   `-m, --moving`: Moving (source) image path. Required unless `--config` is provided.
+*   `--fixed_mask`: Path to a fixed image mask (metric is only evaluated where the mask > 0).
+*   `--mask_labels`: List of integers to extract from a multi-label mask (e.g., `--mask_labels 1 2`). If not provided, all non-zero values are used.
+*   `--border_mask`: Number of voxels to ignore at the image boundaries to prevent padding artifacts (default: 5).
+*   `--clip`: Clip intensities to `[min, max]` before normalizing (e.g., `--clip -1000 400` for lung CT). 
+*   `-o, --output`: Output warped moving image path (default: `./moving_warped.nii.gz`).
+*   `-w, --warp`: Output warp field path. Can be used as a flag without a value (defaults to `./warpfield.nii.gz`).
+*   `--gpu`: Force use GPU if available.
+*   `--spacing`: Grid spacing at the finest level, in voxels. Determines knot resolution. (default: 8, indicative: 4, 8, 16).
+*   `--scale_factor`: Downsample scale factor (e.g., `0.5` for 50% size) to conserve memory and drastically speed up processing over massive volumes. (default: 1.0)
+*   `--lambda_reg`: Regularization weight base, or list per scale. If a single value is provided (like `0.15`), it is applied uniformly across all scales. Higher values yield stiffer deformations. (indicative range: 0.05 - 0.5)
+*   `--iterations`: Iterations per resolution level. Can be a single scalar or a list from coarsest to finest. (default: `160 120 80`, indicative: 50-300 per level).
+*   `--metric`: Similarity metric to optimize. Available: `lcc` (Local Cross-Correlation), `ssd` (Sum of Squared Differences), `nuclear`, `emse` (Edge MSE), `ngf` (Normalized Gradient Field), `vfc`. (default: `lcc`).
+*   `--metric_param`: Metric-specific parameter (e.g. LCC standard deviation, NGF alpha). (default: 2.1).
 
 ### 2. `ptvwarp` (Apply Transformation)
 
-Use `ptvwarp` to apply a previously computed transformation field onto a new image (e.g., reslicing moving segmented masks into the fixed image physical space natively via exact NIfTI affines without registration):
+Use `ptvwarp` to apply a previously computed transformation field onto a new image in the identical space (e.g., reslicing moving segmented masks into the fixed image physical space natively via exact NIfTI affines):
 
 ```bash
 ptvwarp -i moving_mask.nii.gz -r fixed_ct.nii.gz -w warp.nii.gz -o resliced_mask.nii.gz --interp nearest
 ```
+
+**Full Argument List:**
+*   `-i, --input`: Input moving image to warp (Required).
+*   `-r, --ref`: Reference fixed image. Used to define output space padding, dimensions, and header/affine (Required).
+*   `-w, --warp`: Warp field computed by `ptvreg` (NIfTI, pTVreg format) (Required).
+*   `-o, --output`: Output resliced/warped image path (Required).
+*   `--interp`: Interpolation order. Choices: `['linear', 'cubic', 'nearest']` (default: `cubic`). Use `nearest` for label maps/segmentations.
 
 ### Pairwise Registration (Fixed vs Moving in Code)
 

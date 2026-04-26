@@ -13,8 +13,9 @@ from pTVreg.deformation import warp_image
 
 def main():
     parser = argparse.ArgumentParser(description='pTVreg: Python Image Registration', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('-f', '--fixed', required=True, help='Fixed image path')
-    parser.add_argument('-m', '--moving', required=True, help='Moving image path')
+    parser.add_argument('-c', '--config', help='Path to JSON configuration file to bypass command line arguments')
+    parser.add_argument('-f', '--fixed', help='Fixed image path')
+    parser.add_argument('-m', '--moving', help='Moving image path')
     parser.add_argument('--fixed_mask', default=None, help='Path to fixed image mask (metric only evaluated where mask > 0)')
     parser.add_argument('--mask_labels', type=int, nargs='+', default=None, help='List of integers to extract from the multi-label mask (e.g., --mask_labels 1 2). If not provided, all non-zero values are used.')
     parser.add_argument('--border_mask', type=int, default=5, help='Number of voxels to ignore at the image boundaries to prevent padding artifacts')
@@ -39,6 +40,17 @@ def main():
         sys.exit(1)
         
     args = parser.parse_args()
+    
+    if args.config:
+        print(f"Loading configuration from {args.config}")
+        with open(args.config, 'r') as f:
+            config_data = json.load(f)
+            for key, value in config_data.items():
+                if hasattr(args, key) and key != 'config':
+                    setattr(args, key, value)
+                    
+    if not args.fixed or not args.moving:
+        parser.error('the following arguments are required: -f/--fixed, -m/--moving (unless --config is provided)')
     
     print(f"Loading fixed: {args.fixed}")
     fixed_img = nib.load(args.fixed)
@@ -195,9 +207,11 @@ def main():
     # Save registration metadata to a JSON sidecar file
     json_path = args.output.replace('.nii.gz', '.json').replace('.nii', '.json')
     print(f"Saving registration metadata to: {json_path}")
-    
+
     # Filter out or convert non-serializable arguments if needed
     metadata = vars(args).copy()
+    # Add actual device used (cpu/cuda)
+    metadata['device_used'] = device
     with open(json_path, 'w') as f:
         json.dump(metadata, f, indent=4)
 
