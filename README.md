@@ -1,106 +1,195 @@
 # pTVreg Python Port
 
-This directory contains a pure Python/PyTorch implementation of the pTVreg image registration algorithms, originally written in MATLAB/MEX (`COPD_final.m`, `ptv_register.m`). This port has been extensively optimized to match and exceed the original C++ performance while solving critical mathematical rigidities in PyTorch.
+A pure Python/PyTorch implementation of the pTVreg deformable image registration algorithm, faithfully ported from the original MATLAB/MEX code (`ptv_register.m`, `COPD_final.m`) and validated to match MATLAB output quality on clinical CT data.
 
-## New Features & Optimizations
+## MATLAB Parity
 
-*   **GPU Acceleration**: Uses PyTorch for all operations, enabling massive speedups on CUDA devices.
-*   **Exact MATLAB Parity**: Matches the `csqrt=5e-3` Huber-smoothed $L_2/L_1$ optimization scheme on B-Spline knot control points using L-BFGS to stop unrealistic biological organ stretching.
-*   **Massive Speedups**:
-    *   **Separable 1D Convolutions**: Dense $O(N^3)$ 3D Gaussians for the Local Cross-Correlation (LCC) metric mathematically factored into sequential $O(3N)$ 1D boundaries.
-    *   **Grid Caching**: Zero-overhead spatial coordinate generation via `_cached_grids` for instantaneous `F.grid_sample` lookups mapping pixels to indices.
-    *   **Anti-aliasing**: Strict sequential 1D Gaussian blurring precedes all multi-resolution pyramid decimation steps.
-*   **Memory Efficiency for Large Volumes ([512, 512, 531])**:
-    *   `--scale_factor` argument allows dynamic downsampling before computing the dense multi-level gradient optimization to fit 24GB VRAM limits.
-    *   Automatically upsamples the resultant warp field via `trilinear` interpolation and applies the final warp cleanly at original resolution (dropping to CPU if VRAM bursts).
-*   **Intensity Normalization**: Actively normalizes all input images strictly to `[0, 1]` ranges and pads zero-variance denominators with `1e-8` to prevent L-BFGS line-search explosions and parameter dilution.
+Five critical bugs present in earlier Python ports have been identified and fixed:
+
+| # | Component | Bug | Fix |
+|---|-----------|-----|-----|
+| 1 | Pyramid | Hardcoded `n_levels=3`; MATLAB computes ~9 levels automatically | `_auto_nlvl()`: `min(floor(log(sz/max(4,gs)) / log(1/k_down)))` over all dims |
+| 2 | LCC sigma | Fixed at 2.1 px for all levels and all axes | Per-level: `sigma_px = max(0.8, sigma_mm / voxel_size_mm)` per axis |
+| 3 | Pyramid blur | `sigma = 0.5/k_down` — 2.5× too large | `sigma = 0.4 * 0.5 / k_down` matching MATLAB |
+| 4 | LCC formula | Used $r^2$ (squared correlation) | Uses Pearson $r$, loss = $1 - r$, variance stabilised with `deps=1e-5` before sqrt |
+| 5 | TV units | Divided by `pix_res × grid_spacing` (mm²/voxel), making z-TV ~9× weaker on anisotropic CT | `Dk / grid_spacing` only — pix_res cancels because strain = $\Delta u_\text{px} / gs$ |
+
+## Features
+
+- **GPU acceleration** via PyTorch; automatic CPU fallback on VRAM overflow
+- **Auto pyramid levels** matching MATLAB's formula (typically 9 levels for 512³ CT)
+- **Anisotropic LCC** — sigma scaled independently per axis from physical mm spacing
+- **Separable 1-D Gaussian** anti-aliasing before each pyramid decimation step
+- **Huber-smoothed isotropic TV** regularisation on B-spline knot displacements (`csqrt=5e-3`)
+- **L-BFGS with strong Wolfe line search** — same solver as MATLAB
+- **VFC metric** (Vector Field Convolution, Li & Acton 2007) — self-contained, no extra dependencies; uses kornia for edge extraction when available
+- **`--scale_factor`** pre-downsampling for volumes too large to fit in GPU memory
+- **`--clip`** intensity windowing before normalisation (e.g. `-1000 400` for lung CT)
 
 ## Installation
 
-You can install the package and its CLI tool globally or in your virtual environment:
-
 ```bash
-# Install as an editable package (recommended for development)
 pip install -e .
 ```
 
-*Note: This automatically installs all required dependencies from `pyproject.toml` and makes the `ptvreg` command available everywhere.*
+This installs all dependencies from `pyproject.toml` and makes `ptvreg` and `ptvwarp` available on `PATH`.
 
 ## Usage
 
-### Command Line Interface (CLI)
+### `ptvreg` — registration
 
-The package provides two main CLI tools for registration and applying warps:
-
-### 1. `ptvreg` (Image Registration)
-
-The `ptvreg` CLI single-handedly handles scaling, solver optimization, and final high-res warp application. It supports loading parameters from a JSON configuration file.
+#### Quick start (LCC, matching MATLAB `COPD_final.m` settings)
 
 ```bash
-ptvreg -f ct.nii.gz -m mri.nii.gz -w warp.nii.gz -o warped.nii.gz \
-    --spacing 8 --lambda_reg 0.15 --iterations 160 120 80 --scale_factor 0.5 
+ptvreg \
+  -f fixed.nii.gz \
+  -m moving.nii.gz \
+  -o moving_warped.nii.gz \
+  -w warpfield.nii.gz \
+  --spacing 4 --metric lcc --metric_param 2.1 \
+  --lambda_reg 0.11 --border_mask 5 --iterations 80 --gpu
 ```
 
-**Alternatively, use a JSON config file to bypass command line arguments:**
+#### VFC metric
+
+```bash
+ptvreg \
+  -f fixed.nii.gz \
+  -m moving.nii.gz \
+  -o moving_warped.nii.gz \
+  -w warpfield.nii.gz \
+  --spacing 4 --metric vfc --vfc-radius 15.0 --vfc-gamma 1.7 \
+  --lambda_reg 0.11 --border_mask 5 --iterations 80 --gpu
+```
+
+Supply pre-computed edge maps (e.g. from label boundaries) instead of deriving them from image gradients:
+
+```bash
+ptvreg \
+  -f fixed.nii.gz -m moving.nii.gz -o out.nii.gz \
+  --metric vfc \
+  --fixed-edgemap fixed_edges.nii.gz \
+  --moving-edgemap moving_edges.nii.gz \
+  --vfc-sign-invariant
+```
+
+#### JSON config file
+
 ```bash
 ptvreg -c config.json
 ```
 
-**Full Argument List:**
-*   `-c, --config`: Path to JSON configuration file to automatically populate all parameters (bypasses command line arguments).
-*   `-f, --fixed`: Fixed (target) image path. Required unless `--config` is provided.
-*   `-m, --moving`: Moving (source) image path. Required unless `--config` is provided.
-*   `--fixed_mask`: Path to a fixed image mask (metric is only evaluated where the mask > 0).
-*   `--mask_labels`: List of integers to extract from a multi-label mask (e.g., `--mask_labels 1 2`). If not provided, all non-zero values are used.
-*   `--border_mask`: Number of voxels to ignore at the image boundaries to prevent padding artifacts (default: 5).
-*   `--clip`: Clip intensities to `[min, max]` before normalizing (e.g., `--clip -1000 400` for lung CT). 
-*   `-o, --output`: Output warped moving image path (default: `./moving_warped.nii.gz`).
-*   `-w, --warp`: Output warp field path. Can be used as a flag without a value (defaults to `./warpfield.nii.gz`).
-*   `--gpu`: Force use GPU if available.
-*   `--spacing`: Grid spacing at the finest level, in voxels. Determines knot resolution. (default: 8, indicative: 4, 8, 16).
-*   `--scale_factor`: Downsample scale factor (e.g., `0.5` for 50% size) to conserve memory and drastically speed up processing over massive volumes. (default: 1.0)
-*   `--lambda_reg`: Regularization weight base, or list per scale. If a single value is provided (like `0.15`), it is applied uniformly across all scales. Higher values yield stiffer deformations. (indicative range: 0.05 - 0.5)
-*   `--iterations`: Iterations per resolution level. Can be a single scalar or a list from coarsest to finest. (default: `160 120 80`, indicative: 50-300 per level).
-*   `--metric`: Similarity metric to optimize. Available: `lcc` (Local Cross-Correlation), `ssd` (Sum of Squared Differences), `nuclear`, `emse` (Edge MSE), `ngf` (Normalized Gradient Field), `vfc`. (default: `lcc`).
-*   `--metric_param`: Metric-specific parameter (e.g. LCC standard deviation, NGF alpha). (default: 2.1).
+#### Full argument reference
 
-### 2. `ptvwarp` (Apply Transformation)
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-c, --config` | — | JSON config file; bypasses all other CLI arguments |
+| `-f, --fixed` | — | Fixed (target) image (NIfTI) |
+| `-m, --moving` | — | Moving (source) image (NIfTI) |
+| `-o, --output` | `./moving_warped.nii.gz` | Output warped image |
+| `-w, --warp` | `./warpfield.nii.gz` | Output warp field (omit flag to skip saving) |
+| `--fixed_mask` | — | Fixed-image mask; metric evaluated only where mask > 0 |
+| `--mask_labels` | — | Label IDs to extract from a multi-label mask |
+| `--border_mask` | `5` | Voxels to exclude at image borders |
+| `--clip` | — | Intensity window `[min max]` before normalisation (e.g. `-1000 400`) |
+| `--gpu` | off | Use CUDA if available |
+| `--spacing` | `8` | Control-point grid spacing at finest level (voxels); try 4 for high-res CT |
+| `--scale_factor` | `1.0` | Pre-downsample factor to reduce memory (e.g. `0.5`) |
+| `--lambda_reg` | `0.15` | TV regularisation weight; single value or list per level (coarsest→finest) |
+| `--iterations` | `160 120 80` | L-BFGS iterations per level; single value or list |
+| `--metric` | `lcc` | Similarity metric: `lcc`, `ssd`, `nuclear`, `emse`, `vfc` |
+| `--metric_param` | `2.1` | LCC sigma in mm |
+| `--fixed-edgemap` | — | Pre-computed edge-magnitude NIfTI for fixed image (VFC only) |
+| `--moving-edgemap` | — | Pre-computed edge-magnitude NIfTI for moving image (VFC only) |
+| `--vfc-radius` | `15.0` | VFC kernel radius in mm — larger = smoother, longer-range pull |
+| `--vfc-gamma` | `1.7` | VFC kernel decay exponent — larger = more localised |
+| `--vfc-sign-invariant` | off | Use $\cos^2$ alignment loss (good for label-derived edge maps) |
 
-Use `ptvwarp` to apply a previously computed transformation field onto a new image in the identical space (e.g., reslicing moving segmented masks into the fixed image physical space natively via exact NIfTI affines):
+---
+
+### `ptvwarp` — apply a saved warp field
 
 ```bash
-ptvwarp -i moving_mask.nii.gz -r fixed_ct.nii.gz -w warp.nii.gz -o resliced_mask.nii.gz --interp nearest
+ptvwarp \
+  -i moving_mask.nii.gz \
+  -r fixed.nii.gz \
+  -w warpfield.nii.gz \
+  -o resliced_mask.nii.gz \
+  --interp nearest
 ```
 
-**Full Argument List:**
-*   `-i, --input`: Input moving image to warp (Required).
-*   `-r, --ref`: Reference fixed image. Used to define output space padding, dimensions, and header/affine (Required).
-*   `-w, --warp`: Warp field computed by `ptvreg` (NIfTI, pTVreg format) (Required).
-*   `-o, --output`: Output resliced/warped image path (Required).
-*   `--interp`: Interpolation order. Choices: `['linear', 'cubic', 'nearest']` (default: `cubic`). Use `nearest` for label maps/segmentations.
+| Argument | Description |
+|----------|-------------|
+| `-i, --input` | Moving image to warp |
+| `-r, --ref` | Reference (fixed) image — defines output space |
+| `-w, --warp` | Warp field saved by `ptvreg` |
+| `-o, --output` | Output image |
+| `--interp` | `linear` \| `cubic` \| `nearest` (use `nearest` for segmentations) |
 
-### Pairwise Registration (Fixed vs Moving in Code)
+---
+
+### Python API
 
 ```python
 from pTVreg.registration import PTVRegistration
 import nibabel as nib
 
-# Load data
-fixed = nib.load('fixed.nii.gz').get_fdata()
-moving = nib.load('moving.nii.gz').get_fdata()
+fixed  = nib.load('fixed.nii.gz').get_fdata().astype('float32')
+moving = nib.load('moving.nii.gz').get_fdata().astype('float32')
 
-# Initialize
-reg = PTVRegistration(fixed, moving, grid_spacing=8, device='cuda', lambda_reg=0.15)
-
-# Optimize
-warped, flow = reg.optimize(iterations=[160, 120, 80])
-
-# Do what you wish with warped array
+reg = PTVRegistration(
+    fixed, moving,
+    grid_spacing=4,
+    pix_resolution=[1.5, 1.5, 2.5],   # mm, from NIfTI header
+    device='cuda',
+    metric='lcc',
+    metric_param=2.1,
+    lambda_reg=0.11,
+    border_mask=5,
+    n_levels=None,                     # auto-compute à la MATLAB
+)
+warped, flow = reg.optimize(iterations=80)
 ```
 
-## Files
+#### VFC via Python API
 
-*   `pTVreg/cli.py`: The single CLI entry point that replaces previously separated scripts (`pTVreg.py`/`pTVwarp.py`). Handles PyTorch GPU dispatch, Niftis, and dynamic VRAM fallback scaling.
-*   `pTVreg/registration.py`: Main `PTVRegistration` class handling the optimization loop, gradients and multi-resolution Gaussians.
-*   `pTVreg/deformation.py`: Core geometric primitives. Grid scaling, caching, displacement tensor math.
-*   `pTVreg/metrics.py`: The heavily structured LCC, SSD, and TV mathematical constraints.
+```python
+reg = PTVRegistration(
+    fixed, moving,
+    grid_spacing=4,
+    pix_resolution=[1.5, 1.5, 2.5],
+    device='cuda',
+    metric='vfc',
+    vfc_radius=15.0,
+    vfc_gamma=1.7,
+    lambda_reg=0.11,
+    # Optionally pass pre-computed edge maps (numpy arrays, same shape as images):
+    # fixed_edgemap=fixed_edges,
+    # moving_edgemap=moving_edges,
+    # vfc_sign_invariant=True,
+)
+warped, flow = reg.optimize(iterations=80)
+```
+
+## VFC metric — how it works
+
+Vector Field Convolution (Li & Acton, *IEEE Trans. Image Process.* 2007) replaces pointwise intensity comparison with a comparison of smooth *attraction fields* computed from image edges.
+
+1. An edge-magnitude map $e(\mathbf{x}) \in [0,1]$ is extracted from each image (kornia `SpatialGradient3d` when available, otherwise central differences in mm units).
+2. The VFC kernel $\mathbf{k}(\mathbf{r}) = -\hat{\mathbf{r}} / \|\mathbf{r}\|^{\gamma+1}$ is built once per pyramid level in physical (mm) space, then normalised per component.
+3. Each edge map is convolved with $\mathbf{k}$ via zero-padded FFT, producing a smooth 3-component vector field $\mathbf{F} \in \mathbb{R}^{3 \times D \times H \times W}$ that points toward nearby edges.
+4. The fixed VFC field is pre-computed once per level. The moving VFC field is also pre-computed once, then **warped** (not recomputed) at each L-BFGS iteration — this is ~50× cheaper than rerunning the FFT convolution per step.
+5. The loss is the mean **cosine distance**: $\mathcal{L} = 1 - \hat{\mathbf{F}}_\text{fix} \cdot \hat{\mathbf{F}}_\text{mov,warped}$
+
+With `--vfc-sign-invariant` the loss becomes $1 - \cos^2(\cdot)$, which is insensitive to sign flips — useful when edge maps are derived from label boundaries.
+
+## File overview
+
+| File | Purpose |
+|------|---------|
+| `pTVreg/registration.py` | `PTVRegistration` class: multi-scale L-BFGS optimisation loop, pyramid construction, TV regularisation |
+| `pTVreg/metrics.py` | `LocalCrossCorrelation`, `VFCMetric`, `EdgeMSE`, `MultiChannelLCC` |
+| `pTVreg/deformation.py` | Grid sampling, displacement field primitives, `warp_image` |
+| `pTVreg/cli.py` | `ptvreg` CLI entry point |
+| `pTVreg/cli_warp.py` | `ptvwarp` CLI entry point |
+| `pTVreg/utils.py` | NIfTI I/O helpers |
