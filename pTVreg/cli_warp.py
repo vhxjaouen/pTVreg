@@ -2,6 +2,7 @@ import argparse
 import sys
 import numpy as np
 import nibabel as nib
+import torch
 from scipy.ndimage import map_coordinates
 
 def save_nifti(data, path, affine=np.eye(4)):
@@ -26,7 +27,9 @@ def main():
     print(f"Loading reference: {args.ref}")
     ref_img = nib.load(args.ref)
     ref_data = ref_img.get_fdata()
-    ref_shape = ref_data.shape
+    # Use only spatial (first 3) dimensions as the output grid
+    ref_shape = tuple(ref_data.shape[:3])
+    ndim = 3
     ref_affine = ref_img.affine
     
     print(f"Loading moving input: {args.input}")
@@ -38,57 +41,52 @@ def main():
     warp_img = nib.load(args.warp)
     warp_data = warp_img.get_fdata()
     
-    # Process flow shape: pTVreg warp is usually (D, H, W, 3)
-    if warp_data.shape[-1] == 3:
-        flow = np.moveaxis(warp_data, -1, 0)
-    elif warp_data.shape[0] == 3:
+    # Process flow shape: pTVreg warp is (D, H, W, 3) or (3, D, H, W)
+    if warp_data.ndim == 4 and warp_data.shape[-1] == 3:
+        flow = np.moveaxis(warp_data, -1, 0)   # -> (3, D, H, W)
+    elif warp_data.ndim == 4 and warp_data.shape[0] == 3:
         flow = warp_data
     else:
-        flow = warp_data.squeeze()
-        if flow.shape[-1] == 3:
-            flow = np.moveaxis(flow, -1, 0)
-        elif flow.shape[0] == 3:
-            pass
+        warp_sq = warp_data.squeeze()
+        if warp_sq.ndim == 4 and warp_sq.shape[-1] == 3:
+            flow = np.moveaxis(warp_sq, -1, 0)
+        elif warp_sq.ndim == 4 and warp_sq.shape[0] == 3:
+            flow = warp_sq
         else:
             raise ValueError(f"Unexpected warp field shape: {warp_data.shape}")
 
-    # Check and resize flow if it doesn't match the reference shape
-    if flow.shape[1:] != ref_shape:
-        print(f"Warning: Warp field shape {flow.shape[1:]} does not match reference shape {ref_shape}. Resizing flow...")
-        from scipy.ndimage import zoom
-        scale_factors = [n / o for n, o in zip(ref_shape, flow.shape[1:])]
-        zoom_factors = [1.0] + scale_factors 
-        flow = zoom(flow, zoom_factors, order=1)
-        # Scale flow displacements accordingly
+    # Reslice flow to reference spatial shape if sizes differ
+    flow_shape = tuple(flow.shape[1:])
+    if flow_shape != ref_shape:
+        print(f"Reslicing warp field from {flow_shape} to {ref_shape}...")
+        scale_factors = [n / o for n, o in zip(ref_shape, flow_shape)]
+        # Use torch for efficient trilinear upsampling
+        flow_t = torch.from_numpy(flow).unsqueeze(0).float()  # (1, 3, d, h, w)
+        flow_t = torch.nn.functional.interpolate(
+            flow_t, size=ref_shape, mode='trilinear', align_corners=True
+        ).squeeze(0)  # (3, D, H, W)
+        # Scale displacement magnitudes to match the new voxel grid
         for c in range(3):
-            flow[c] *= scale_factors[c]
+            flow_t[c] *= scale_factors[c]
+        flow = flow_t.numpy()
 
     # Create voxel grid for reference image
-    ndim = len(ref_shape)
-    coords_ref = np.indices(ref_shape, dtype=np.float32)
+    coords_ref = np.indices(ref_shape, dtype=np.float32)  # (3, D, H, W)
     
-    # Add flow (which is in reference voxel space). Flow channels match dimensions (e.g., z, y, x)
+    # Add flow (displacements in reference voxel units, order: z, y, x)
     coords_ref_warped = coords_ref + flow
     
-    # Flatten to list of coordinates for affine transformation
-    # ref coords shape: (3, N)
+    # Flatten to (3, N), augment to homogeneous (4, N)
     coords_ref_warped_flat = coords_ref_warped.reshape(ndim, -1)
-    
-    # Augment to homogeneous coordinates (4, N)
     coords_ref_warped_hom = np.vstack([coords_ref_warped_flat, np.ones((1, coords_ref_warped_flat.shape[1]))])
     
-    # M_ref -> physical
+    # ref voxel -> physical -> moving voxel
     phys_coords = ref_affine @ coords_ref_warped_hom
-    
-    # physical -> M_mov
     inv_input_affine = np.linalg.inv(input_affine)
     mov_coords_hom = inv_input_affine @ phys_coords
     
-    # Extract moving voxel coordinates (3, N)
-    mov_coords = mov_coords_hom[:ndim, :]
-    
-    # Reshape back to (3, D, H, W)
-    mov_coords = mov_coords.reshape((ndim,) + ref_shape)
+    # Extract and reshape moving voxel coordinates to (3, D, H, W)
+    mov_coords = mov_coords_hom[:ndim, :].reshape((ndim,) + ref_shape)
     
     print(f"Applying warp with interpolation: {args.interp}")
     order_map = {'nearest': 0, 'linear': 1, 'cubic': 3}
@@ -101,3 +99,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -1,3 +1,4 @@
 [console_scripts]
 ptvreg = pTVreg.cli:main
+ptvreg-vec = pTVreg.cli_vec:main
 ptvwarp = pTVreg.cli_warp:main

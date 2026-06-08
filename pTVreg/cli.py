@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--border_mask', type=int, default=5, help='Number of voxels to ignore at the image boundaries to prevent padding artifacts')
     parser.add_argument('--clip', type=float, nargs=2, default=None, help='Clip intensities to [min, max] before normalizing (e.g., 80 900 for lung CT)')
     parser.add_argument('-o', '--output', default='./moving_warped.nii.gz', help='Output warped image path')
+    parser.add_argument('-e', '--edge', nargs='*', type=float, default=None, help='Align gradient edge magnitude instead of images. Optional: two floats for gaussian smoothing sigmas (fixed, moving).')
     
     parser.add_argument('-w', '--warp', nargs='?', const='./warpfield.nii.gz', default=None, 
                         help='Output warp field path. If flag is set without value, defaults to ./warpfield.nii.gz')
@@ -31,8 +32,20 @@ def main():
     
     parser.add_argument('--lambda_reg', type=float, nargs='+', default=[0.15], help='Regularization weight base, or list per scale. If a single value is provided, it is applied uniformly across all scales. (indicative range: 0.05 - 0.5)')
     parser.add_argument('--iterations', type=int, nargs='+', default=[160, 120, 80], help='Iterations per level. Can be a single scalar or a list (coarsest to finest). (indicative: 50-300 per level)')
-    parser.add_argument('--metric', choices=['lcc', 'ssd', 'nuclear', 'emse', 'ngf', 'vfc'], default='lcc', help='Similarity metric (default: lcc)')
-    parser.add_argument('--metric_param', type=float, default=2.1, help='Metric parameter (e.g. LCC sigma, NGF alpha). (indicative ranges: 1.5 - 4.0 for LCC, )')
+    parser.add_argument('--metric', choices=['lcc', 'ssd', 'nuclear', 'emse', 'vfc'], default='lcc', help='Similarity metric (default: lcc)')
+    parser.add_argument('--metric_param', type=float, default=2.1, help='Metric parameter: LCC sigma in mm (indicative: 1.5-4.0)')
+    # VFC-specific flags
+    parser.add_argument('--fixed-edgemap', dest='fixed_edgemap', default=None,
+                        help='Pre-computed edge-magnitude NIfTI for fixed image (VFC metric). '
+                             'If not set, computed from gradient magnitude of the fixed intensity image.')
+    parser.add_argument('--moving-edgemap', dest='moving_edgemap', default=None,
+                        help='Pre-computed edge-magnitude NIfTI for moving image (VFC metric).')
+    parser.add_argument('--vfc-radius', dest='vfc_radius', type=float, default=15.0,
+                        help='VFC kernel radius in mm (default: 15.0). Larger = smoother, longer-range pull.')
+    parser.add_argument('--vfc-gamma', dest='vfc_gamma', type=float, default=1.7,
+                        help='VFC kernel decay exponent (default: 1.7). Larger = more localised.')
+    parser.add_argument('--vfc-sign-invariant', dest='vfc_sign_invariant', action='store_true',
+                        help='Use cos^2 alignment (sign-invariant). Useful when edge maps come from label boundaries.')
 
     
     if len(sys.argv) == 1:
@@ -63,6 +76,8 @@ def main():
     print(f"Loading fixed: {args.fixed}")
     fixed_img = nib.load(args.fixed)
     fixed_data = fixed_img.get_fdata().astype(np.float32)
+    # Keep spacing in array axis order used by this CLI (X,Y,Z from nibabel get_fdata).
+    fixed_pix_resolution = np.array(fixed_img.header.get_zooms()[:3], dtype=np.float32)
     
     print(f"Loading moving: {args.moving}")
     moving_img = nib.load(args.moving)
@@ -88,6 +103,21 @@ def main():
         
     orig_shape = fixed_data.shape
 
+    if args.edge is not None:
+        print("Computing gradient edge magnitudes...")
+        sig_fixed = args.edge[0] if len(args.edge) >= 1 else 0.0
+        sig_moving = args.edge[1] if len(args.edge) >= 2 else 0.0
+        
+        def compute_edge(data, sigma):
+            if sigma > 0.0:
+                return ndimage.gaussian_gradient_magnitude(data, sigma)
+            else:
+                grads = np.gradient(data)
+                return np.sqrt(sum(g**2 for g in grads))
+                
+        fixed_data = compute_edge(fixed_data, sig_fixed)
+        moving_data = compute_edge(moving_data, sig_moving)
+
     # Normalize intensities strictly to [0, 1] 
     # Ensures LCC correlation scales predictably within float32 limits
     fixed_data = (fixed_data - np.min(fixed_data)) / (np.ptp(fixed_data) + 1e-8)
@@ -100,6 +130,7 @@ def main():
         # Scale for faster convergence and lower memory imprint on massive volumes
         fixed_data = ndimage.zoom(fixed_data, args.scale_factor, order=1)
         moving_data = ndimage.zoom(moving_data, args.scale_factor, order=1)
+        fixed_pix_resolution = fixed_pix_resolution / max(args.scale_factor, 1e-8)
         print(f"Scaled shapes: {fixed_data.shape}")
 
     
@@ -114,17 +145,37 @@ def main():
     
     print(f"Using device: {device}")
     
-    n_levels = len(args.iterations) if len(args.iterations) > 1 else 3
-    
-    reg = PTVRegistration(fixed_data, moving_data, 
+    fixed_edgemap_data = None
+    if args.fixed_edgemap:
+        print(f"Loading fixed edgemap: {args.fixed_edgemap}")
+        fixed_edgemap_data = nib.load(args.fixed_edgemap).get_fdata().astype(np.float32)
+        if args.scale_factor != 1.0:
+            fixed_edgemap_data = ndimage.zoom(fixed_edgemap_data, args.scale_factor, order=1)
+
+    moving_edgemap_data = None
+    if args.moving_edgemap:
+        print(f"Loading moving edgemap: {args.moving_edgemap}")
+        moving_edgemap_data = nib.load(args.moving_edgemap).get_fdata().astype(np.float32)
+        if args.scale_factor != 1.0:
+            moving_edgemap_data = ndimage.zoom(moving_edgemap_data, args.scale_factor, order=1)
+
+    # n_levels=None triggers MATLAB-style auto-computation from image size;
+    # the iterations list is padded to however many levels are auto-selected.
+    reg = PTVRegistration(fixed_data, moving_data,
                           fixed_mask=fixed_mask,
                           border_mask=args.border_mask,
-                          grid_spacing=args.spacing, 
+                          grid_spacing=args.spacing,
+                          pix_resolution=fixed_pix_resolution.tolist(),
                           device=device,
-                          lambda_reg=args.lambda_reg, 
-                          n_levels=n_levels,
+                          lambda_reg=args.lambda_reg,
+                          n_levels=None,
                           metric=args.metric,
-                          metric_param=args.metric_param)
+                          metric_param=args.metric_param,
+                          fixed_edgemap=fixed_edgemap_data,
+                          moving_edgemap=moving_edgemap_data,
+                          vfc_radius=args.vfc_radius,
+                          vfc_gamma=args.vfc_gamma,
+                          vfc_sign_invariant=args.vfc_sign_invariant)
     
     print(f"Starting optimization (Metric={args.metric}, Reg={args.lambda_reg}, Iters={args.iterations})...")
     # Pass the iterations list/scalar to optimize
@@ -132,48 +183,32 @@ def main():
     
     # Save warped image
     print(f"Saving warped image to: {args.output}")
-
-    # Normalize intensities strictly to [0, 1] 
-    # Ensures LCC correlation scales predictably within float32 limits
-    fixed_data = (fixed_data - np.min(fixed_data)) / (np.ptp(fixed_data) + 1e-8)
-    moving_min = np.min(moving_data)
-    moving_ptp = np.ptp(moving_data) + 1e-8
-    moving_data = (moving_data - moving_min) / moving_ptp
+    if flow.dim() == len(orig_shape) + 1:
+        flow = flow.unsqueeze(0)
 
     if args.scale_factor != 1.0:
-        # Upsample flow back to original shape: (1, 3, D, H, W)
         print(f"Upsampling warp field back to original size {orig_shape}...")
-        
-        # Scale displacement magnitudes by inverse of scale factor
-        if flow.dim() == len(orig_shape) + 1:
-            flow = flow.unsqueeze(0)
         mode = 'trilinear' if len(orig_shape) == 3 else 'bilinear'
         full_flow = torch.nn.functional.interpolate(flow, size=orig_shape, mode=mode, align_corners=True).squeeze(0)
         full_flow = full_flow / args.scale_factor
-        
-        # Target original image space resolution to prevent quality loss in output
-        print("Warping original resolution moving image with upsampled flow field...")
-        moving_orig_tensor = torch.tensor(moving_img.get_fdata().astype(np.float32), device=device).unsqueeze(0).unsqueeze(0)
-        full_flow_tensor = full_flow.unsqueeze(0).to(device)
-        
-        # If running large volumes, dynamically fallback to host RAM if GPU memory gets exceeded on the final high-res grid sample
-        try:
-            with torch.no_grad():
-                original_warped = warp_image(moving_orig_tensor, full_flow_tensor).squeeze().cpu().numpy()
-        except torch.cuda.OutOfMemoryError:
-            print("VRAM limit exceeded during final full-resolution WARP! Falling back to CPU warp...")
-            moving_orig_tensor = moving_orig_tensor.cpu()
-            full_flow_tensor = full_flow_tensor.cpu()
-            with torch.no_grad():
-                original_warped = warp_image(moving_orig_tensor, full_flow_tensor).squeeze().numpy()
-            
-        warped_np = original_warped
-        warped_np = (warped_np * moving_ptp) + moving_min
-        flow_np = full_flow.detach().cpu().numpy()
     else:
-        warped_np = warped.detach().cpu().numpy().squeeze()
-        
-        flow_np = flow.detach().cpu().numpy().squeeze() # (3, D, H, W)
+        full_flow = flow.squeeze(0)
+
+    print("Warping original resolution moving image with flow field...")
+    moving_orig_tensor = torch.tensor(moving_img.get_fdata().astype(np.float32), device=device).unsqueeze(0).unsqueeze(0)
+    full_flow_tensor = full_flow.unsqueeze(0).to(device)
+
+    try:
+        with torch.no_grad():
+            warped_np = warp_image(moving_orig_tensor, full_flow_tensor).squeeze().cpu().numpy()
+    except torch.cuda.OutOfMemoryError:
+        print("VRAM limit exceeded during final full-resolution WARP! Falling back to CPU warp...")
+        moving_orig_tensor = moving_orig_tensor.cpu()
+        full_flow_tensor = full_flow_tensor.cpu()
+        with torch.no_grad():
+            warped_np = warp_image(moving_orig_tensor, full_flow_tensor).squeeze().numpy()
+
+    flow_np = full_flow.detach().cpu().numpy()
         
     # Use affine from fixed image since we registered to it
     
