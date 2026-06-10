@@ -46,6 +46,18 @@ def main():
                         help='VFC kernel decay exponent (default: 1.7). Larger = more localised.')
     parser.add_argument('--vfc-sign-invariant', dest='vfc_sign_invariant', action='store_true',
                         help='Use cos^2 alignment (sign-invariant). Useful when edge maps come from label boundaries.')
+    # Label-guided soft-Dice loss
+    parser.add_argument('--fixed-labels', dest='fixed_labels', default=None,
+                        help='Multi-label segmentation NIfTI for fixed image (e.g. TotalSegmentator output). '
+                             'Enables soft-Dice guidance on top of the main metric.')
+    parser.add_argument('--moving-labels', dest='moving_labels', default=None,
+                        help='Multi-label segmentation NIfTI for moving image.')
+    parser.add_argument('--dice-weight', dest='dice_weight', type=float, default=0.5,
+                        help='Weight for the soft-Dice label loss term (default: 0.5). '
+                             'Set to 0 to disable even when --fixed-labels is supplied.')
+    parser.add_argument('--dice-labels', dest='dice_labels', type=int, nargs='+', default=None,
+                        help='Label IDs to include in the soft-Dice loss (e.g. --dice-labels 3 4 11 12 13 14 15). '
+                             'If not set, all shared non-zero labels are used.')
 
     
     if len(sys.argv) == 1:
@@ -159,6 +171,20 @@ def main():
         if args.scale_factor != 1.0:
             moving_edgemap_data = ndimage.zoom(moving_edgemap_data, args.scale_factor, order=1)
 
+    fixed_labels_data = None
+    if args.fixed_labels:
+        print(f"Loading fixed labels: {args.fixed_labels}")
+        fixed_labels_data = np.round(nib.load(args.fixed_labels).get_fdata()).astype(np.int32)
+        if args.scale_factor != 1.0:
+            fixed_labels_data = ndimage.zoom(fixed_labels_data, args.scale_factor, order=0)  # nearest
+
+    moving_labels_data = None
+    if args.moving_labels:
+        print(f"Loading moving labels: {args.moving_labels}")
+        moving_labels_data = np.round(nib.load(args.moving_labels).get_fdata()).astype(np.int32)
+        if args.scale_factor != 1.0:
+            moving_labels_data = ndimage.zoom(moving_labels_data, args.scale_factor, order=0)  # nearest
+
     # n_levels=None triggers MATLAB-style auto-computation from image size;
     # the iterations list is padded to however many levels are auto-selected.
     reg = PTVRegistration(fixed_data, moving_data,
@@ -175,7 +201,11 @@ def main():
                           moving_edgemap=moving_edgemap_data,
                           vfc_radius=args.vfc_radius,
                           vfc_gamma=args.vfc_gamma,
-                          vfc_sign_invariant=args.vfc_sign_invariant)
+                          vfc_sign_invariant=args.vfc_sign_invariant,
+                          fixed_labels=fixed_labels_data,
+                          moving_labels=moving_labels_data,
+                          dice_weight=args.dice_weight,
+                          dice_labels=args.dice_labels)
     
     print(f"Starting optimization (Metric={args.metric}, Reg={args.lambda_reg}, Iters={args.iterations})...")
     # Pass the iterations list/scalar to optimize

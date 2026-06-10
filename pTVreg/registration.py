@@ -5,14 +5,15 @@ import torch.optim as optim
 import numpy as np
 from .deformation import knots_to_dense_flow, warp_image
 from .utils import to_torch, to_numpy
-from .metrics import LocalCrossCorrelation, EdgeMSE, VFCMetric, MultiChannelLCC
+from .metrics import LocalCrossCorrelation, EdgeMSE, VFCMetric, MultiChannelLCC, compute_soft_dice_loss
 
 class PTVRegistration(nn.Module):
     def __init__(self, fixed_image, moving_image, fixed_mask=None, border_mask=5,
                  grid_spacing=4, pix_resolution=1.0, device='cpu',
                  lambda_reg=0.11, n_levels=None, metric='lcc', metric_param=2.1, k_down=0.7,
                  fixed_edgemap=None, moving_edgemap=None,
-                 vfc_radius=15.0, vfc_gamma=1.7, vfc_sign_invariant=False):
+                 vfc_radius=15.0, vfc_gamma=1.7, vfc_sign_invariant=False,
+                 fixed_labels=None, moving_labels=None, dice_weight=0.5, dice_labels=None):
         """
         Args:
             fixed_image: (D, H, W) or (N, D, H, W) or None (for groupwise)
@@ -28,6 +29,11 @@ class PTVRegistration(nn.Module):
             vfc_radius: VFC kernel radius in mm (default 15.0)
             vfc_gamma: VFC kernel decay exponent (default 1.7)
             vfc_sign_invariant: use cos^2 alignment loss (good for label-derived edge maps)
+            fixed_labels: optional (D, H, W) integer array — multi-label segmentation map for fixed image
+            moving_labels: optional (D, H, W) integer array — multi-label segmentation map for moving image
+            dice_weight: weight for the soft-Dice label loss term (default 0.5)
+            dice_labels: explicit list of label IDs to use for dice (e.g. [3,4,11,12]).
+                         If None, all shared non-zero labels are used.
         """
         super().__init__()
         self.device = device
@@ -141,6 +147,21 @@ class PTVRegistration(nn.Module):
         self._cur_fix_vfc = None
         self._cur_mov_vfc = None
 
+        # Soft-Dice label guidance
+        self.dice_weight = float(dice_weight)
+        self.dice_labels = list(dice_labels) if dice_labels else None
+        self.fixed_label_pyramid = None
+        self.moving_label_pyramid = None
+        if fixed_labels is not None and moving_labels is not None:
+            fl_t = to_torch(fixed_labels, device=device, dtype=torch.int32)
+            if fl_t.ndim == 3:
+                fl_t = fl_t.unsqueeze(0).unsqueeze(0)
+            ml_t = to_torch(moving_labels, device=device, dtype=torch.int32)
+            if ml_t.ndim == 3:
+                ml_t = ml_t.unsqueeze(0).unsqueeze(0)
+            self.fixed_label_pyramid = self._create_label_pyramid(fl_t, n_levels)
+            self.moving_label_pyramid = self._create_label_pyramid(ml_t, n_levels)
+
         # Initialize knots (control points)
         self.knots = None
 
@@ -190,6 +211,23 @@ class PTVRegistration(nn.Module):
                     blurred = F.conv3d(blurred, kx, padding=(0, 0, pad), groups=C)
                 current = F.interpolate(blurred, scale_factor=self.k_down, mode='trilinear', align_corners=True, recompute_scale_factor=True)
         return pyramid[::-1] # Coarsest to finest
+
+    def _create_label_pyramid(self, label_map, levels):
+        """Build a coarsest-to-finest pyramid for an integer label map.
+
+        Uses nearest-neighbor interpolation only — no anti-aliasing blur —
+        to preserve discrete label values at every scale.
+        label_map: (1, 1, D, H, W) int32 tensor.
+        """
+        # Cast to float for F.interpolate, then back to int32
+        current = label_map.float()
+        pyramid = []
+        for i in range(levels):
+            pyramid.append(current.to(torch.int32))
+            if i < levels - 1:
+                current = F.interpolate(current, scale_factor=self.k_down,
+                                        mode='nearest', recompute_scale_factor=True)
+        return pyramid[::-1]  # coarsest to finest
 
     def forward(self, level_idx):
         # Current resolution
@@ -280,13 +318,30 @@ class PTVRegistration(nn.Module):
 
             metric_loss = metric_map[active_mask].mean() if active_mask.any() else metric_map.mean()
 
+        # Soft-Dice label guidance (optional)
+        dice_loss = None
+        if self.fixed_label_pyramid is not None and self.moving_label_pyramid is not None:
+            fix_lbl = self.fixed_label_pyramid[level_idx]   # (1, 1, D', H', W') int32
+            mov_lbl = self.moving_label_pyramid[level_idx]
+            # Resize to match current image resolution if pyramid shapes diverge slightly
+            curr_shape = warped.shape[2:]
+            if tuple(fix_lbl.shape[2:]) != curr_shape:
+                fix_lbl = F.interpolate(fix_lbl.float(), size=curr_shape, mode='nearest').to(torch.int32)
+            if tuple(mov_lbl.shape[2:]) != curr_shape:
+                mov_lbl = F.interpolate(mov_lbl.float(), size=curr_shape, mode='nearest').to(torch.int32)
+            dice_loss = compute_soft_dice_loss(fix_lbl, mov_lbl, flow,
+                                                label_filter=self.dice_labels)
+
         # Compute smoothed Isotropic TV gradient magnitudes matching COPD_final.m
         Dk_grad = self.get_Dk(self.knots, level_idx)
         grad_mag = torch.sqrt(torch.sum(Dk_grad**2, dim=(1, 2)) + csqrt)
         tv_loss = torch.mean(grad_mag)
-        
+
         current_lambda = self.lambda_reg[level_idx]
-        return metric_loss + current_lambda * tv_loss, metric_loss, tv_loss
+        total = metric_loss + current_lambda * tv_loss
+        if dice_loss is not None and self.dice_weight > 0.0:
+            total = total + self.dice_weight * dice_loss
+        return total, metric_loss, tv_loss, dice_loss
 
     def optimize(self, iterations=80, lr=1.0):
         """
@@ -370,7 +425,7 @@ class PTVRegistration(nn.Module):
                 optimizer.zero_grad()
                 warped, flow = self.forward(i)
                 fixed_curr = self.fixed_pyramid[i] if self.fixed_pyramid else None
-                loss, m_loss, tv = self.compute_loss(warped, fixed_curr, flow, i)
+                loss, m_loss, tv, _ = self.compute_loss(warped, fixed_curr, flow, i)
                 # Scale loss to avoid early stopping in LBFGS due to small gradients
                 scaled_loss = loss * 1e4
                 scaled_loss.backward()
@@ -384,7 +439,8 @@ class PTVRegistration(nn.Module):
             with torch.no_grad():
                 warped, flow = self.forward(i)
                 fixed_curr = self.fixed_pyramid[i] if self.fixed_pyramid else None
-                _, m_loss, true_tv = self.compute_loss(warped, fixed_curr, flow, i)
-                print(f"Level {i}: Final Metric={m_loss.item():.6f}, True TV={true_tv.item():.6f}")
+                _, m_loss, true_tv, dice = self.compute_loss(warped, fixed_curr, flow, i)
+                dice_str = f", Dice={dice.item():.6f}" if dice is not None else ""
+                print(f"Level {i}: Final Metric={m_loss.item():.6f}, True TV={true_tv.item():.6f}{dice_str}")
         
         return self.forward(self.n_levels - 1)

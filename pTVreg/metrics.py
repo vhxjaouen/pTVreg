@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .deformation import warp_image
 
 class LocalCrossCorrelation(nn.Module):
     """
@@ -369,3 +370,59 @@ class MultiChannelLCC(nn.Module):
         if return_map:
             return torch.mean(torch.stack(channel_losses, dim=0), dim=0)
         return torch.mean(torch.stack(channel_losses))
+
+
+def compute_soft_dice_loss(
+    fixed_labels: torch.Tensor,
+    moving_labels: torch.Tensor,
+    flow: torch.Tensor,
+    eps: float = 1e-5,
+    label_filter: list = None,
+) -> torch.Tensor:
+    """Soft multi-label Dice loss for label-guided registration.
+
+    For each label in ``label_filter`` that is present in both fixed and moving
+    maps, the moving binary channel is bilinearly warped with ``flow`` and a
+    soft Dice score is computed against the fixed binary channel at the native
+    pyramid-level resolution.  The loss is the mean of ``(1 - dice_l)`` over
+    matched labels.  Background (label 0) is always excluded.
+
+    Args:
+        fixed_labels:  (1, 1, D, H, W) integer tensor — fixed label map.
+        moving_labels: (1, 1, D, H, W) integer tensor — moving label map
+                       at the same pyramid resolution.
+        flow:          (1, 3, D, H, W) float tensor — pixel displacements
+                       (z, y, x channel order), same spatial size as labels.
+        eps:           Numerical stability constant.
+        label_filter:  Explicit list of integer label IDs to evaluate.
+                       Labels absent from either map at the current level are
+                       silently skipped.  If None, all shared non-zero labels
+                       are used.
+
+    Returns:
+        Scalar tensor; 0.0 (detached) if no matching labels exist.
+    """
+    if label_filter:
+        candidates = set(int(l) for l in label_filter)
+        candidates.discard(0)
+        shared = candidates & set(fixed_labels.unique().tolist()) & set(moving_labels.unique().tolist())
+    else:
+        shared = set(fixed_labels.unique().tolist()) & set(moving_labels.unique().tolist())
+        shared.discard(0)
+
+    if not shared:
+        return flow.new_zeros(1).squeeze()
+
+    dice_loss = flow.new_zeros(1).squeeze()
+    for lbl in shared:
+        lbl = int(lbl)
+        fixed_bin = (fixed_labels == lbl).float()    # (1, 1, D, H, W)
+        moving_bin = (moving_labels == lbl).float()  # (1, 1, D, H, W)
+        # Bilinear warp of moving binary map into fixed space.
+        # padding_mode='zeros': out-of-bounds → label absent (0).
+        warped_moving_bin = warp_image(moving_bin, flow, mode='bilinear', padding_mode='zeros')
+        intersection = (fixed_bin * warped_moving_bin).sum()
+        denom = fixed_bin.sum() + warped_moving_bin.sum() + eps
+        dice_loss = dice_loss + (1.0 - 2.0 * intersection / denom)
+
+    return dice_loss / len(shared)
